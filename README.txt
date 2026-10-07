@@ -8,7 +8,7 @@ The dashboard:
 - keeps separate accuracy statistics for every asset
 - lets you enter the Robinhood target in the browser
 - freezes the original prediction for the current 15-minute round
-- updates a separate live recommendation once per minute and says whether
+- updates a separate live recommendation every 5 seconds and says whether
   it is still the same or has changed based on the live price, the move from
   round start, and the remaining time
 - updates the live multi-exchange proxy automatically

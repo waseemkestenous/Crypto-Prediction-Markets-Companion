@@ -362,13 +362,18 @@ def live_worker():
                 round_end = STATE["round_end"]
                 prediction = STATE["prediction"]
                 history_index = HISTORY["index"]
-                recommendation_minute = STATE["recommendation_minute"]
+                live_recommendation = STATE["live_recommendation"]
 
             minute_key = max(0, int((now - current_start).total_seconds() // 60))
+            recommendation_due = (
+                live_recommendation is None
+                or (now - live_recommendation["updated_at"]).total_seconds()
+                >= core.LIVE_RECOMMENDATION_REFRESH_SECONDS
+            )
             if (
                 prediction is not None
                 and history_index is not None
-                and minute_key != recommendation_minute
+                and recommendation_due
             ):
                 recommendation = core.build_live_recommendation(
                     round_info=prediction,
@@ -381,12 +386,25 @@ def live_worker():
                     if STATE["prediction"] is prediction:
                         STATE["live_recommendation"] = recommendation
                         STATE["recommendation_minute"] = minute_key
+                        live_recommendation = recommendation
 
             seconds_left = (
                 round_end - now
             ).total_seconds() if round_end else 999
 
             interval = 1.0 if seconds_left <= 65 else 3.0
+            if live_recommendation is not None:
+                recommendation_age = (
+                    now - live_recommendation["updated_at"]
+                ).total_seconds()
+                interval = min(
+                    interval,
+                    max(
+                        0.15,
+                        core.LIVE_RECOMMENDATION_REFRESH_SECONDS
+                        - recommendation_age,
+                    ),
+                )
 
         except Exception as exc:
             with LOCK:

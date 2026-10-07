@@ -20,7 +20,7 @@ It DOES:
 - estimate/capture the round-start benchmark automatically
 - analyze historical BTC behavior before the round
 - freeze one UP/DOWN probability at the start
-- publish a separate live recommendation once per minute using the current
+- publish a separate live recommendation every 5 seconds using the current
   price, the move since round start, and the time remaining
 - evaluate that frozen prediction at settlement
 - print HIT or MISS
@@ -128,6 +128,9 @@ DEFAULT_WEIGHT_BASE_SCORE = 0.01
 
 # How often to refresh the live current-price display during the round.
 DEFAULT_LIVE_REFRESH_SECONDS = 3.0
+
+# Recalculate the price-conditioned live recommendation during an active round.
+LIVE_RECOMMENDATION_REFRESH_SECONDS = 5.0
 
 # Target mode:
 # manual = ask user for Robinhood's real target each round
@@ -3143,7 +3146,7 @@ def monitor_round_until_last_minute(
     )
 
     live_recommendation = None
-    recommendation_minute = None
+    recommendation_updated_at = None
 
     while True:
         now = datetime.now().astimezone()
@@ -3177,8 +3180,12 @@ def monitor_round_until_last_minute(
         except Exception:
             current_market_price = None
 
-        current_minute = max(0, int((now - round_info["start"]).total_seconds() // 60))
-        if current_market_price is not None and current_minute != recommendation_minute:
+        recommendation_due = (
+            recommendation_updated_at is None
+            or (now - recommendation_updated_at).total_seconds()
+            >= LIVE_RECOMMENDATION_REFRESH_SECONDS
+        )
+        if current_market_price is not None and recommendation_due:
             live_recommendation = build_live_recommendation(
                 round_info=round_info,
                 current_price=current_market_price,
@@ -3186,7 +3193,7 @@ def monitor_round_until_last_minute(
                 index=index,
                 context_hours=context_hours,
             )
-            recommendation_minute = current_minute
+            recommendation_updated_at = now
 
         print_round(
             round_info=round_info,
@@ -3204,9 +3211,18 @@ def monitor_round_until_last_minute(
         if remaining_to_capture <= 0:
             break
 
+        recommendation_wait = LIVE_RECOMMENDATION_REFRESH_SECONDS
+        if recommendation_updated_at is not None:
+            recommendation_wait = max(
+                0.25,
+                LIVE_RECOMMENDATION_REFRESH_SECONDS
+                - (now - recommendation_updated_at).total_seconds(),
+            )
+
         time.sleep(
             min(
                 refresh_seconds,
+                recommendation_wait,
                 max(
                     0.25,
                     remaining_to_capture,
