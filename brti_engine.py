@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Crypto Prediction Markets Companion for Robinhood
+BTC TargetPulse
 
-Multi-asset 15-minute prediction-market companion using a free multi-exchange USD proxy.
+Multi-asset companion using the CF Benchmarks BRTI page for live BTC prices.
 
 DESIGN GOAL
 -----------
@@ -40,12 +40,9 @@ It is used only to display/evaluate the round.
 
 BENCHMARK
 ---------
-This version does NOT require a CF Benchmarks license.
-
-It builds a FREE multi-exchange BRTI-like proxy from public BTC/USD data
-(Coinbase, Kraken, Bitstamp, Gemini and Crypto.com when available).
-
-This is NOT official CME CF BRTI. Robinhood's official settlement can differ.
+Live BTC prices are parsed from the CF Benchmarks BRTI website.
+Other assets and historical candles use a multi-exchange USD proxy.
+Website snapshots and sampled settlement can differ from platform settlement.
 
 INSTALL
 -------
@@ -62,9 +59,12 @@ Stop with Ctrl+C.
 """
 
 import argparse
+import threading
+from brti_website import read_live_brti, MAX_QUOTE_AGE_SECONDS, SOURCE_POLL_INTERVAL_SECONDS
 import json
 import math
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -82,6 +82,7 @@ import requests
 # Free/public exchange endpoints used to construct a BRTI-LIKE proxy.
 # This is NOT the official CME CF BRTI.
 COINBASE_BASE = "https://api.exchange.coinbase.com"
+CF_BRTI_URL = "https://www.cfbenchmarks.com/data/indices/BRTI"
 
 KRAKEN_TICKER = "https://api.kraken.com/0/public/Ticker"
 KRAKEN_OHLC = "https://api.kraken.com/0/public/OHLC"
@@ -320,7 +321,7 @@ def http_get_json(url, params=None, auth=None, timeout=10):
 
 class BenchmarkSource:
     """
-    Free multi-exchange BRTI-like proxy.
+    BRTI website snapshots for BTC; multi-exchange proxy for other assets.
 
     Live proxy:
       - fetch BTC/USD spot quotes from several public exchanges
@@ -329,22 +330,109 @@ class BenchmarkSource:
       - take the median of the remaining exchange mid-prices
 
     IMPORTANT:
-    This is NOT CME CF BRTI and must not be labeled as official BRTI.
+    Historical exchange candles remain a proxy, including for BTC.
     """
 
-    def __init__(self, requested="proxy", asset=DEFAULT_ASSET):
+    def __init__(self, requested="auto", asset=DEFAULT_ASSET):
         self.requested = requested
         self.asset = asset.upper()
         if self.asset not in ASSET_CONFIGS:
             raise ValueError(f"Unsupported asset: {asset}")
         self.config = ASSET_CONFIGS[self.asset]
-        self.mode = "proxy"
+        if requested not in {"auto", "cfbenchmarks", "proxy"}:
+            raise ValueError(f"Unsupported price source: {requested}")
+        if requested == "cfbenchmarks" and self.asset != "BTC":
+            raise ValueError("The BRTI page only provides BTC/USD prices.")
+        self.mode = "cfbenchmarks" if self.asset == "BTC" and requested != "proxy" else "proxy"
         self.last_quotes = {}
         self.last_errors = {}
+        self.last_quote_at = None
+        self.last_quote_value = None
+        self.last_fetched_at = None
+        self.last_transport = None
+        self._last_html_check = None
+        self._brti_lock = threading.RLock()
+        self.last_brti_snapshot = None
 
     @property
     def label(self):
+        if self.mode == "cfbenchmarks":
+            return "CF Benchmarks BRTI (website)"
         return f"Multi-exchange {self.asset}/USD proxy"
+
+    @staticmethod
+    def parse_brti_page(html):
+        """Read the current BRTI summary, never a chart or another index price."""
+        match = re.search(
+            r'<script\b[^>]*\bid=[\"\']__NEXT_DATA__[\"\'][^>]*>(.*?)</script\s*>',
+            html, re.DOTALL | re.IGNORECASE,
+        )
+        if not match:
+            raise RuntimeError("CF Benchmarks page is missing its index data.")
+        try:
+            page = json.loads(match.group(1))["props"]["pageProps"]
+            if page["externalIndexId"] != "BRTI":
+                raise ValueError("Unexpected index identifier")
+            value = float(page["indexSummary"]["value"])
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("Invalid BRTI price")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid CF Benchmarks BRTI data: {exc}") from exc
+        return value
+
+    @staticmethod
+    def parse_brti_timestamp(html):
+        match = re.search(r'<script\b[^>]*\bid=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script\s*>', html, re.DOTALL | re.IGNORECASE)
+        try:
+            stamp = json.loads(match.group(1))['props']['pageProps']['indexSummary']['lastUpdated']
+            if isinstance(stamp, bool) or not math.isfinite(float(stamp)) or float(stamp) <= 0:
+                raise ValueError('Invalid lastUpdated')
+            return datetime.fromtimestamp(float(stamp)/1000, tz=timezone.utc)
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(f'BRTI source timestamp missing or invalid: {exc}') from exc
+
+    def _accept_brti_snapshot(self, value, source_time, fetched_at, transport):
+        with self._brti_lock:
+            now = datetime.now(timezone.utc)
+            if self.last_quote_at is not None and source_time <= self.last_quote_at:
+                age = (now-self.last_quote_at).total_seconds()
+                if 0 <= age <= MAX_QUOTE_AGE_SECONDS:
+                    return self.last_quote_value
+                raise RuntimeError(f'No newer BRTI quote; last accepted quote age is {age:.1f}s.')
+            age = (now-source_time).total_seconds()
+            if not math.isfinite(value) or value <= 0 or not 0 <= age <= MAX_QUOTE_AGE_SECONDS:
+                raise RuntimeError(f'BRTI source quote age is {age:.1f}s or price invalid; maximum age is {MAX_QUOTE_AGE_SECONDS}s.')
+            self.last_quote_value = value
+            self.last_quote_at = source_time
+            self.last_fetched_at = fetched_at
+            self.last_transport = transport
+            self.last_brti_snapshot = {'value':value,'source_time':source_time,
+                                       'fetched_at':fetched_at,'transport':transport}
+            return value
+
+    def _brti_quote(self):
+        try:
+            snapshot = read_live_brti()
+        except Exception:
+            pass
+        else:
+            return self._accept_brti_snapshot(snapshot['value'],snapshot['source_time'],
+                                              snapshot['fetched_at'],'Live rendered website')
+        with self._brti_lock:
+            tick = time.monotonic()
+            if self._last_html_check is not None and tick-self._last_html_check < SOURCE_POLL_INTERVAL_SECONDS:
+                if self.last_quote_at is not None and 0 <= (datetime.now(timezone.utc)-self.last_quote_at).total_seconds() <= MAX_QUOTE_AGE_SECONDS:
+                    return self.last_quote_value
+                raise RuntimeError(f'Waiting for the next {SOURCE_POLL_INTERVAL_SECONDS}-second BRTI source check; no fresh quote available.')
+            self._last_html_check = tick
+        response = SESSION.get(
+            CF_BRTI_URL, timeout=10,
+            headers={'Accept':'text/html','Cache-Control':'no-cache'},
+        )
+        response.raise_for_status()
+        return self._accept_brti_snapshot(self.parse_brti_page(response.text),
+                    self.parse_brti_timestamp(response.text),datetime.now(timezone.utc),
+                    'HTML snapshot (live browser unavailable)')
 
     @staticmethod
     def _mid(bid, ask, last=None):
@@ -479,6 +567,16 @@ class BenchmarkSource:
         )
 
     def latest(self):
+        if self.mode == "cfbenchmarks":
+            try:
+                value = self._brti_quote()
+            except Exception as exc:
+                self.last_quotes = {}
+                self.last_errors = {"CF Benchmarks BRTI": str(exc)}
+                raise
+            self.last_quotes = {"CF Benchmarks BRTI": value}
+            self.last_errors = {}
+            return value
         fetchers = {
             "Coinbase": self._coinbase_quote,
             "Kraken": self._kraken_quote,
@@ -3415,13 +3513,6 @@ def load_stats(asset=DEFAULT_ASSET):
 
 
 def save_stats(stats):
-    stats["rounds"] = (
-        stats.get(
-            "rounds",
-            [],
-        )[-1000:]
-    )
-
     stats_file = stats_file_for_asset(stats.get("_asset", DEFAULT_ASSET))
     tmp = stats_file.with_suffix(
         ".tmp"
@@ -4198,7 +4289,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Crypto Prediction Markets Companion for Robinhood: 15-minute predictions "
+            "BTC TargetPulse: 15-minute predictions "
             "based only on pre-round history."
         )
     )
@@ -4314,11 +4405,14 @@ def main():
     parser.add_argument(
         "--source",
         choices=[
+            "auto",
+            "cfbenchmarks",
             "proxy",
         ],
-        default="proxy",
+        default="auto",
         help=(
-            "Price source. v9 uses the free multi-exchange BRTI-like proxy."
+            "Live price source: auto parses the CF Benchmarks BRTI page for BTC "
+            "and uses the multi-exchange proxy for other assets."
         ),
     )
 
@@ -4377,8 +4471,7 @@ def main():
     )
     print("Independent companion tool — not affiliated with or endorsed by Robinhood.")
     print(
-        "Live proxy combines public spot quotes from Coinbase, Kraken, "
-        "Bitstamp, Gemini and Crypto.com when available."
+        f"Live price source: {source.label}."
     )
     print(
         "Historical proxy merges public 1-minute candles from the exchanges "
@@ -4411,8 +4504,8 @@ def main():
         f"(the Robinhood target DOES affect the target-aware probability)"
     )
     print(
-        "WARNING: proxy prices and proxy settlement are estimates; "
-        "Robinhood uses official CME CF BRTI."
+        "Historical prices and sampled settlement are estimates; "
+        "the platform's official settlement can differ."
     )
     print()
 

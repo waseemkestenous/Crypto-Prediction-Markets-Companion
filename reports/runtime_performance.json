@@ -1,0 +1,33 @@
+{
+  "method": "Median local timings on isolated copies of the journal, with warm caches; no live browser orders. The live dataset grew from 201 to 202 rounds during measurement.",
+  "before": {
+    "rounds": 201,
+    "current_round_lookup_ms": 97.52,
+    "state_request_ms": 217.89,
+    "history_request_ms": 901.93
+  },
+  "after": {
+    "rounds": 202,
+    "current_round_lookup_ms": 0.08,
+    "state_request_ms": 17.86,
+    "history_request_ms": 184.49,
+    "history_json_bytes": 3493012,
+    "history_gzip_bytes": 428593
+  },
+  "changing_atomic_write": {
+    "before_ms": 245.07,
+    "after_ms": 108.32,
+    "note": "Separate comparison using identical copies and a different field value on every write."
+  },
+  "bounds": {
+    "journal_cache_files": 8,
+    "price_history_cache_windows": 32,
+    "in_memory_order_messages": 500,
+    "sidebar_messages_per_page": 200
+  },
+  "notes": [
+    "Cache entries invalidate on file identity, size, or modification-time change.",
+    "All new order messages are archived in order_status.sqlite3; Older logs retrieves previous pages.",
+    "No changes to source polling intervals, quote-age limits, or order checks."
+  ]
+}

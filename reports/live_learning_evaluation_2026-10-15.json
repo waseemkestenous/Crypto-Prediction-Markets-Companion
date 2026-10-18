@@ -1,0 +1,42 @@
+{
+  "status": "shadow",
+  "usable_rounds": 93,
+  "excluded_rounds": 2,
+  "minimum_rounds": 40,
+  "features": [
+    "baseline_logit",
+    "gap_over_range",
+    "range_pct",
+    "move_imbalance",
+    "reversal_rate",
+    "minute_momentum",
+    "round_progress"
+  ],
+  "blend": 0.25,
+  "baseline": {
+    "rounds": 28,
+    "samples": 137,
+    "brier": 0.1523041755037698,
+    "log_loss": 0.45643430554447917,
+    "accuracy": 0.7476190476190477
+  },
+  "candidate": {
+    "rounds": 28,
+    "samples": 137,
+    "brier": 0.15081718717348536,
+    "log_loss": 0.4510692562999571,
+    "accuracy": 0.761904761904762
+  },
+  "training_rounds": 65,
+  "validation_rounds": 28,
+  "training_end": "2026-10-15T15:30:00-05:00",
+  "validation_start": "2026-10-15T15:45:00-05:00",
+  "evaluation_note": "Retrospective reconstruction, round-weighted scores. Fixed activation gate not met; original Live probability retained. This is not an execution or profit test.",
+  "activation_gate": {
+    "minimum_rounds": 40,
+    "minimum_validation_rounds": 10,
+    "minimum_brier_improvement": 0.002,
+    "lower_log_loss": true,
+    "no_accuracy_decrease": true
+  }
+}

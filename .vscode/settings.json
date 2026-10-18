@@ -1,0 +1,15 @@
+{
+  "files.exclude": {
+  "**/.robinhood-browser": true,
+  "**/.venv": true,
+  "**/.vscode": true,
+  "**/.git": true,
+  "**/__pycache__": true
+},
+  "files.watcherExclude": {
+    "**/.robinhood-browser/**": true
+  },
+  "search.exclude": {
+    "**/.robinhood-browser": true
+  }
+}
