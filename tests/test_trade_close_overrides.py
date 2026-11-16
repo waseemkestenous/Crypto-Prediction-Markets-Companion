@@ -33,6 +33,22 @@ class TradeCloseOverrideTests(unittest.TestCase):
         self.purchase['ignore_stop_loss']=False
         self.assertTrue(rh.stop_loss_matches(self.p,60,self.start,self.end))
 
+    def test_force_buy_disables_all_automatic_exits(self):
+        for origin in ({'purchase_rule':'force_buy'}, {'conditions':{'rule':'force_buy'}}):
+            with self.subTest(origin=origin):
+                self.p['purchase'] = dict(self.purchase, **origin)
+                self.assertFalse(rh.close_conditions_match(self.p,60,self.start,self.end))
+                self.assertFalse(rh.stop_loss_matches(self.p,60,self.start,self.end))
+                self.assertFalse(rh.sale_conditions_match(self.p,60,self.start,self.end))
+                self.p['purchase']['force_close_token'] = 'trade-token'
+                self.assertTrue(rh.sale_conditions_match(self.p,60,self.start,self.end))
+                with tempfile.TemporaryDirectory() as folder,patch.object(round_history,'ROOT',Path(folder)):
+                    round_history.upsert('BTC',self.start.isoformat(),self.end.isoformat(),purchase=self.p['purchase'])
+                    for reason in ('close_conditions', 'stop_loss'):
+                        self.assertFalse(app.record_robinhood_purchase('BTC',self.start,self.end,
+                            {'target':83000,'close_order':{'status':'attempted','reason':reason}}))
+                    self.assertNotIn('close_order',round_history.load('BTC')[0]['purchase'])
+
     def test_endpoint_is_trade_scoped_and_persists(self):
         with tempfile.TemporaryDirectory() as folder,patch.object(round_history,'ROOT',Path(folder)),patch.object(app.ARGS,'asset','BTC'),patch.object(app,'current_round_key',return_value=(self.start,self.end)):
             round_history.upsert('BTC',self.start.isoformat(),self.end.isoformat(),purchase=self.purchase)

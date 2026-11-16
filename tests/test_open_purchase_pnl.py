@@ -30,3 +30,36 @@ class OpenPnlTests(unittest.TestCase):
             self.assertEqual(app.open_purchase_pnl(self.row,self.now)['status'],'unavailable')
             self.row['purchase']['close_order']={'status':'filled'}
             self.assertIsNone(app.open_purchase_pnl(self.row,self.now))
+
+    def test_virtual_pnl_uses_displayed_quote_for_held_side(self):
+        self.row['purchase']['test_mode'] = True
+        prices = {'asset':'BTC','round_start':self.row['round_start'],'target':83000,
+                  'yes_cents':80,'no_cents':21,'updated_at':self.now.isoformat()}
+        with patch.dict(app.STATE, contract_prices=prices, holding_quote=None):
+            result = app.open_purchase_pnl(self.row, self.now)
+            self.assertAlmostEqual(result['net_pnl'], .0612)
+            self.assertEqual(result['price_source'], 'displayed_contract_quote')
+            self.row['purchase']['direction'] = 'DOWN / BELOW'
+            self.assertAlmostEqual(app.open_purchase_pnl(self.row, self.now)['net_pnl'], -.5288)
+            prices['no_cents'] = 0
+            self.assertAlmostEqual(app.open_purchase_pnl(self.row, self.now)['net_pnl'], -.7388)
+
+    def test_virtual_pnl_rejects_missing_stale_and_wrong_round_quotes(self):
+        self.row['purchase']['test_mode'] = True
+        prices = {'asset':'BTC','round_start':self.row['round_start'],'target':83000,
+                  'yes_cents':80,'no_cents':21,'updated_at':self.now.isoformat()}
+        with patch.dict(app.STATE, contract_prices=prices, holding_quote=self.quote):
+            self.assertEqual(app.open_purchase_pnl(self.row, self.now+timedelta(seconds=11))['status'], 'unavailable')
+            for field, value in [('asset','ETH'), ('target',84000), ('round_start','old'), ('yes_cents',None), ('yes_cents',float('nan'))]:
+                with patch.dict(prices, {field:value}):
+                    self.assertIsNone(app.open_purchase_pnl(self.row, self.now)['net_pnl'])
+        with patch.dict(app.STATE, contract_prices=None, holding_quote=self.quote):
+            self.assertIsNone(app.open_purchase_pnl(self.row, self.now)['net_pnl'])
+
+    def test_virtual_closed_and_settled_pnl(self):
+        import round_history
+        purchase = dict(self.row['purchase'], test_mode=True,
+                        close_order={'status':'filled','contracts':1,'execution_price_cents':80})
+        self.assertAlmostEqual(round_history.trade_pnl(purchase, None), .0612)
+        purchase.pop('close_order')
+        self.assertAlmostEqual(round_history.trade_pnl(purchase, 'UP / ABOVE'), .2806)

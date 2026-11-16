@@ -1,0 +1,37 @@
+{
+  "status": "shadow",
+  "usable_rounds": 266,
+  "excluded_rounds": 3,
+  "minimum_rounds": 40,
+  "features": [
+    "baseline_logit",
+    "gap_over_range",
+    "range_pct",
+    "move_imbalance",
+    "reversal_rate",
+    "minute_momentum",
+    "round_progress"
+  ],
+  "blend": 0.25,
+  "recorded_samples": 839,
+  "replayed_samples": 481,
+  "baseline": {
+    "rounds": 80,
+    "samples": 392,
+    "brier": 0.1721811816529908,
+    "log_loss": 0.5111414393984325,
+    "accuracy": 0.7264583333333333
+  },
+  "candidate": {
+    "rounds": 80,
+    "samples": 392,
+    "brier": 0.17115866039348432,
+    "log_loss": 0.5072272115848377,
+    "accuracy": 0.7239583333333333
+  },
+  "training_rounds": 186,
+  "validation_rounds": 80,
+  "training_end": "2026-10-17T00:00:00-05:00",
+  "validation_start": "2026-10-17T00:15:00-05:00",
+  "evaluation_note": "Chronological round-weighted holdout using recorded pre-learning Live probabilities where available and retrospective replay otherwise. Candidate remains shadow; this does not measure trading profit."
+}

@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 MAX_QUOTE_AGE_SECONDS = 20
-SOURCE_POLL_INTERVAL_SECONDS = 2
+SOURCE_POLL_INTERVAL_SECONDS = 0.5
+HTML_FALLBACK_POLL_INTERVAL_SECONDS = 2
 URL = 'https://www.cfbenchmarks.com/data/indices/BRTI'
 
 

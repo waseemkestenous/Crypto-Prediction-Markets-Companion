@@ -98,3 +98,25 @@ class LearningTests(unittest.TestCase):
             price_history.append_live('BTC',self.start,record)
             saved=json.loads(price_history.path_for('BTC',self.start).with_suffix('.live.jsonl').read_text())
             self.assertEqual(saved['learning'],record['learning'])
+
+    def test_recorded_baselines_use_original_probability_and_exclude_future_or_wrong_target(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(price_history, 'ROOT', Path(folder)):
+            stamp = self.start+timedelta(minutes=5)
+            row = {'updated_at':stamp, 'p_up':.8, 'current_price':100001, 'target_gap':1,
+                   'learning':{'base_p_up':.55}}
+            price_history.append_live('BTC', self.start, row)
+            price_history.append_live('BTC', self.start, dict(row, updated_at=self.end))
+            price_history.append_live('BTC', self.start, dict(row, target_gap=100))
+            self.assertEqual(learning.recorded_baselines('BTC', self.start, self.end, 100000), [(stamp,.55)])
+
+    def test_training_prefers_recorded_probabilities_to_replay(self):
+        rows = self.rows()
+        def recorded(asset, start, end, target):
+            return [(start+timedelta(minutes=m), .6) for m in (2,5,8,11,14)]
+        with patch.object(learning, 'recorded_baselines', side_effect=recorded), \
+                patch.object(price_history, 'load', side_effect=lambda asset,start,end:self.points(start)):
+            learner=learning.LiveLearner()
+            learner.train('BTC', self.start+timedelta(minutes=15*50), rows,
+                          lambda *args: self.fail('Recorded baseline should be used'))
+        self.assertEqual(learner.info['recorded_samples'], 250)
+        self.assertEqual(learner.info['replayed_samples'], 0)

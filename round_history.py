@@ -5,8 +5,9 @@ from collections import OrderedDict
 import math
 import threading
 import tempfile
+import choppiness
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 ROOT = Path(__file__).resolve().parent
 LOCK = threading.RLock()
@@ -47,6 +48,8 @@ def path_for(asset):
 
 _CACHE = OrderedDict()
 CACHE_LIMIT = 8
+_CHOPPINESS_CACHE = OrderedDict()
+CHOPPINESS_CACHE_LIMIT = 256
 
 
 def _signature(path):
@@ -74,8 +77,19 @@ def _read(asset):
 
 
 def _copy_record(row, include_quotes):
-    return deepcopy(row if include_quotes else {key:value for key,value in row.items()
+    return _copy_json(row if include_quotes else {key:value for key,value in row.items()
                     if key not in ('contract_price_history','underlying_price_history')})
+
+
+def _copy_json(value):
+    """Copy JSON containers without deepcopy's per-scalar dispatch overhead."""
+    if isinstance(value, dict):
+        return {key: _copy_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_json(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return deepcopy(value)
 
 
 def load(asset, include_quotes=True):
@@ -88,6 +102,26 @@ def get(asset, start, include_quotes=True):
     with LOCK:
         row = _read(asset)['index'].get(start)
         return _copy_record(row,include_quotes) if row is not None else None
+
+
+def contract_round_choppiness(asset, start, end, asof):
+    """Score one immutable quote snapshot, with bounded caching and no writes."""
+    with LOCK:
+        row = _read(asset)['index'].get(start.isoformat()) or {}
+        samples = row.get('contract_price_history') or ()
+        target = row.get('target')
+        key = (path_for(asset).resolve(), start.isoformat(), end.isoformat())
+        tick = max(0, int((min(asof, end)-start).total_seconds() // choppiness.SAMPLE_SECONDS))
+        cached = _CHOPPINESS_CACHE.get(key)
+        if (cached is None or cached['samples'] is not samples
+                or cached['target'] != target or cached['tick'] != tick):
+            cached = {'samples': samples, 'target': target, 'tick': tick,
+                      'result': choppiness.score(samples, start, end, target, asof)}
+            _CHOPPINESS_CACHE[key] = cached
+        _CHOPPINESS_CACHE.move_to_end(key)
+        while len(_CHOPPINESS_CACHE) > CHOPPINESS_CACHE_LIMIT:
+            _CHOPPINESS_CACHE.popitem(last=False)
+        return deepcopy(cached['result'])
 
 
 def upsert(asset, start, end, **fields):
@@ -104,11 +138,17 @@ def upsert(asset, start, end, **fields):
         if previous is None:
             records.append(record)
         path = path_for(asset)
+        # Historical rows are immutable snapshots. Reuse their JSON encodings
+        # instead of encoding the entire archive for each live quote update.
+        encoded = dict(cached.get('encoded') or {
+            row['round_start']: json.dumps(row, separators=(',', ':'))
+            for row in cached['records']})
+        encoded[start] = json.dumps(record, separators=(',', ':'))
         # Keep the same atomic JSON format; compact encoding avoids rewriting indentation.
         with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, prefix=path.stem+'.', suffix='.tmp', delete=False) as stream:
             temp = Path(stream.name)
             try:
-                stream.write(json.dumps(records,separators=(',',':'))+'\n')
+                stream.write('[' + ','.join(encoded[row['round_start']] for row in records) + ']\n')
             except BaseException:
                 temp.unlink(missing_ok=True)
                 raise
@@ -118,6 +158,7 @@ def upsert(asset, start, end, **fields):
             temp.unlink(missing_ok=True)
         resolved = path.resolve()
         _CACHE[resolved] = {'signature':_signature(path),'records':records,
+                            'encoded': encoded,
                             'index':{row['round_start']:row for row in records}}
         _CACHE.move_to_end(resolved)
         while len(_CACHE)>CACHE_LIMIT:
@@ -284,6 +325,26 @@ def final_prediction_accuracy(records):
     total = len(completed)
     return {'total': total, 'hits': hits, 'misses': total - hits,
             'accuracy': round(hits / total * 100, 2) if total else None}
+
+
+def accuracy_buy_guard(records, settings, now):
+    """Gate buys using settled final predictions within the configured rolling window."""
+    config = settings.get('accuracy_buy_guard') or {}
+    enabled = config.get('enabled', False)
+    threshold = config.get('min_accuracy_pct', 60.0)
+    window_hours = config.get('window_hours', 24.0)
+    cutoff = now - timedelta(hours=window_hours)
+    recent = []
+    for row in records:
+        try:
+            ended = datetime.fromisoformat(row['round_end'])
+            if cutoff < ended <= now:
+                recent.append(row)
+        except (KeyError, TypeError, ValueError):
+            continue
+    stats = final_prediction_accuracy(recent)
+    allowed = not enabled or (stats['total'] > 0 and stats['hits'] * 100 / stats['total'] >= threshold)
+    return dict(stats, enabled=enabled, min_accuracy_pct=threshold, window_hours=window_hours, allowed=allowed)
 
 
 def round_trades(row):

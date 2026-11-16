@@ -44,10 +44,18 @@ class EventTests(unittest.TestCase):
                 self.assertEqual(rh.parse_event(title, '$82,824.63 or above Event day ' + datetime.fromisoformat(start).astimezone(datetime.fromisoformat(end).tzinfo).strftime('%B %d, %Y'), 'BTC',
                                                datetime.fromisoformat(start), datetime.fromisoformat(end)), 82824.63)
 
+    def test_login_page_is_reported_without_waiting_for_market_title(self):
+        page=Mock()
+        page.locator.return_value.inner_text.return_value='Log in to Robinhood Email Password Log In'
+        with self.assertRaisesRegex(ValueError, 'Robinhood login required'):
+            rh.read_event_target(page,'BTC',self.start,self.end)
+        page.get_by_role.assert_not_called()
+        self.assertFalse(rh.login_required(self.text))
+
     def test_visible_heading_preferred_over_stale_tab_title(self):
         page = Mock()
         page.title.return_value = 'Home | Robinhood'
-        heading = page.get_by_role.return_value.first
+        heading = page.get_by_role.return_value.or_.return_value.filter.return_value.first
         heading.inner_text.return_value = self.title
         page.locator.return_value.inner_text.return_value = self.text
         self.assertEqual(rh.read_event_target(page, 'BTC', self.start, self.end), 82824.63)

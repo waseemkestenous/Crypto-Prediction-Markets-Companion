@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import unicodedata
 import order_settings
+import entry_stability
 import round_history
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -60,11 +61,32 @@ def normalize_event_text(value):
     return ' '.join(value.split())
 
 
+def login_required(text):
+    text = normalize_event_text(text)
+    return bool(re.search(r'\bLog in to Robinhood\b', text, re.I)
+                and re.search(r'\bPassword\b', text, re.I))
+
+
 def read_event_target(page, asset, start, end):
-    # Other h1 elements and the tab title may belong to the site shell while
-    # the event is loading. Wait for the actual market heading before parsing.
-    heading = page.get_by_role('heading', name=re.compile(r'15[\s\u200b-\u200f]*min\b', re.I)).first
-    heading.wait_for(state='visible', timeout=30000)
+    if login_required(page.locator('body').inner_text(timeout=5000)):
+        raise ValueError('Robinhood login required: sign in using the app browser profile to resume contract prices.')
+    # Robinhood may render the market title as plain text rather than a heading.
+    # Both paths still pass the full target, clock and calendar-date checks.
+    headings = page.get_by_role('heading', name=re.compile(r'15[\s\u200b-\u200f]*min\b', re.I))
+    market_title = page.get_by_text(re.compile(
+        rf'^[\s\u200b-\u200f]*{re.escape(asset)}[\s\u200b-\u200f]+15[\s\u200b-\u200f]*min\b[^\n]*[·].*(?:EDT|EST)\s*$', re.I))
+    heading = headings.or_(market_title).filter(visible=True).first
+    try:
+        heading.wait_for(state='visible', timeout=30000)
+    except Exception:
+        # Keep a local diagnostic of the actual automated tab for failed reads.
+        try:
+            diagnostic = Path(__file__).resolve().parent / 'outputs' / 'robinhood-reader-diagnostic.png'
+            diagnostic.parent.mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(diagnostic), timeout=5000)
+        except Exception:
+            pass
+        raise
     title = heading.inner_text(timeout=5000)
     return parse_event(title, page.locator('body').inner_text(), asset, start, end)
 
@@ -228,7 +250,7 @@ def prediction_matches(current, expected):
         return False
     def conditions(value):
         result = {k: v for k, v in value.items()
-                  if k not in ('purchase_exists', 'purchase', 'live_snapshot', 'contract_price_history', 'contract_prices')}
+                  if k not in ('purchase_exists', 'purchase', 'live_snapshot', 'contract_price_history', 'contract_prices', 'buy_accuracy_guard', 'buy_choppiness_guard', 'entry_stability')}
         live = value.get('live_snapshot')
         # Updates to confidence/timestamps do not change the order's direction.
         # A missing snapshot still invalidates the draft (stale recommendation).
@@ -253,7 +275,71 @@ def live_strength_matches(prediction):
     return minimum in order_settings.LIVE_STRENGTHS and rank >= order_settings.LIVE_STRENGTHS.index(minimum)
 
 
-def buy_prediction_matches(current, expected, fallback_rule=None):
+def effective_test_mode(prediction):
+    """Use virtual entries while the enabled accuracy guard pauses real buys."""
+    settings = (prediction or {}).get('order_settings') or {}
+    guard = (prediction or {}).get('buy_accuracy_guard') or {}
+    return (settings.get('test_mode') is True
+            or (settings.get('accuracy_buy_guard', {}).get('enabled') is True
+                and guard.get('allowed') is False))
+
+
+def buy_accuracy_guard_allows(prediction):
+    if not prediction:
+        return False
+    if (prediction.get('order_settings') or {}).get('test_mode') is True:
+        return True
+    enabled = (prediction.get('order_settings') or {}).get('accuracy_buy_guard', {}).get('enabled', False)
+    return not enabled or (prediction.get('buy_accuracy_guard') or {}).get('allowed') is True
+
+
+def buy_accuracy_guard_reason(prediction):
+    guard = prediction.get('buy_accuracy_guard') or {}
+    accuracy = guard.get('accuracy')
+    current = f"{accuracy:.2f}%" if accuracy is not None else 'no settled predictions'
+    threshold = ((prediction.get('order_settings') or {}).get('accuracy_buy_guard') or {}).get('min_accuracy_pct', 60)
+    hours = ((prediction.get('order_settings') or {}).get('accuracy_buy_guard') or {}).get('window_hours', 24)
+    return f'Buy paused: Final prediction accuracy over the last {hours:g}h is {current}; required >= {threshold}%.'
+
+
+def buy_choppiness_guard_allows(prediction):
+    if not prediction:
+        return False
+    config = (prediction.get('order_settings') or {}).get('choppiness_buy_guard', {})
+    enabled = any(config.get(key) for key in ('enabled', 'current_enabled', 'block_next_round'))
+    return not enabled or (prediction.get('buy_choppiness_guard') or {}).get('allowed') is True
+
+
+def buy_choppiness_guard_reason(prediction):
+    guard = prediction.get('buy_choppiness_guard') or {}
+    config = (prediction.get('order_settings') or {}).get('choppiness_buy_guard') or {}
+    source = 'BTC' if config.get('source', 'bitcoin') == 'bitcoin' else 'Yes'
+    rounds = config.get('rounds', 3)
+    limit = config.get('current_limit', 7)
+    if guard.get('current_blocked'):
+        return f"Buy paused: current {source} round reached {guard['current_crossings']} midpoint crossings (limit >= {limit})."
+    if guard.get('previous_blocked'):
+        return (f"Buy paused: previous {source} round reached {guard['previous_crossings']} midpoint crossings "
+                f"(limit >= {limit}); the following round is blocked until {guard.get('blocked_until', 'round end')}.")
+    average = guard.get('average_score')
+    if average is None:
+        return (f"Buy paused: Midpoint crossings ({source}) needs {rounds} completed rounds with adequate quotes "
+                f"({guard.get('ready_rounds', 0)}/{rounds} ready).")
+    return (f"Buy paused: average Midpoint crossings ({source}) {average:.2f} over the last {rounds} completed rounds "
+            f"exceeds {config.get('max_score', 3):g}.")
+
+
+def buy_prediction_matches(current, expected, fallback_rule=None, *, force_buy=False):
+    if effective_test_mode(current) != effective_test_mode(expected):
+        return False
+    if not effective_test_mode(current) and not buy_accuracy_guard_allows(current):
+        return False
+    if not buy_choppiness_guard_allows(current):
+        return False
+    if not force_buy and ((current or {}).get('order_settings') or {}).get('entry_stability', {}).get('enabled'):
+        direction = current.get('live_direction') if fallback_rule is not None else purchase_direction(current)
+        if not entry_stability.allows(current, direction, datetime.now().astimezone()):
+            return False
     if fallback_rule is not None:
         if not current or current.get('purchase_exists'):
             return False
@@ -276,12 +362,20 @@ def buy_prediction_matches(current, expected, fallback_rule=None):
     return prediction_matches(current, expected) and live_strength_matches(current)
 
 
-def buy_prediction_change_reason(current, expected):
+def buy_prediction_change_reason(current, expected, *, force_buy=False):
     if not current:
         return 'Buy waiting: current prediction became unavailable while preparing the form.'
+    if not effective_test_mode(current) and not buy_accuracy_guard_allows(current):
+        return buy_accuracy_guard_reason(current)
+    if not buy_choppiness_guard_allows(current):
+        return buy_choppiness_guard_reason(current)
+    stability_enabled = not force_buy and (current.get('order_settings') or {}).get('entry_stability', {}).get('enabled')
+    direction = purchase_direction(current) if stability_enabled else None
+    if not force_buy and not entry_stability.allows(current, direction, datetime.now().astimezone()):
+        return 'Buy waiting: BTC must remain on the buy side of the target for the configured stability duration, with fresh uninterrupted quotes.'
     if not live_strength_matches(current):
         return 'Buy waiting: Live recommendation became stale or fell below the minimum strength while preparing the form.'
-    ignored = {'purchase_exists', 'purchase', 'live_snapshot', 'contract_price_history', 'contract_prices'}
+    ignored = {'purchase_exists', 'purchase', 'live_snapshot', 'contract_price_history', 'contract_prices', 'buy_accuracy_guard', 'buy_choppiness_guard', 'entry_stability'}
     changed = sorted(key for key in (set(current) | set(expected)) - ignored
                      if current.get(key) != expected.get(key))
     current_live, expected_live = current.get('live_snapshot'), expected.get('live_snapshot')
@@ -464,10 +558,36 @@ def prepare_contract_form(page, asset, start, end, get_prediction, report, recor
     if not prediction:
         report('Buy waiting: prediction for the current asset and round is not ready.')
         return False
+    if not effective_test_mode(prediction) and not buy_accuracy_guard_allows(prediction):
+        report(buy_accuracy_guard_reason(prediction))
+        return False
+    if not buy_choppiness_guard_allows(prediction):
+        report(buy_choppiness_guard_reason(prediction))
+        return False
     if prediction.get('purchase_exists'):
         report('Buy skipped: this round already has a purchase or recorded attempt.')
         return False
     settings = order_settings.validate(prediction.get("order_settings", order_settings.DEFAULTS))
+    if fallback and fallback_index < len(settings['fallbacks']):
+        rule = settings['fallbacks'][fallback_index]
+        overrides = {key: rule[key] for key in ('contract_trend_changes', 'min_live_strength')}
+        original_get_prediction = get_prediction
+
+        def get_prediction(*args):
+            current = original_get_prediction(*args)
+            if not current:
+                return current
+            current_settings = current.get('order_settings') or {}
+            current_rules = current_settings.get('fallbacks', [current_settings.get('fallback', {})])
+            selected = current_rules[fallback_index] if fallback_index < len(current_rules) else {}
+            effective = {key: selected.get(key, current_settings.get(key, order_settings.DEFAULTS[key]))
+                         for key in overrides}
+            return dict(current, order_settings=dict(current_settings, **effective))
+
+        prediction = get_prediction(asset, start, end)
+        if not prediction:
+            return False
+        settings = dict(settings, **overrides)
     if not force_buy and not fallback and not settings["primary_enabled"]:
         report("Primary disabled.")
         return False
@@ -492,7 +612,8 @@ def prepare_contract_form(page, asset, start, end, get_prediction, report, recor
                 return False
         settings = dict(settings, min_price_cents=fb['min_price_cents'],max_price_cents=fb['max_price_cents'],
                         contracts=fb['contracts'],purchase_minute_from=fb['minute_from'],purchase_minute_to=fb['minute_to'],
-                        required_models=[],agreement_basis='live',time_in_force=fb['time_in_force'])
+                        required_models=[],agreement_basis='live',time_in_force=fb['time_in_force'],
+                        entry_stability=dict(settings['entry_stability'], enabled=False))
     elif fallback:
         rules = settings['fallbacks']
         if fallback_index >= len(rules):
@@ -528,6 +649,10 @@ def prepare_contract_form(page, asset, start, end, get_prediction, report, recor
     if direction is None:
         report('Order skipped: selected models must all agree with the selected Final prediction / fresh Live recommendation basis.')
         return False
+    if not force_buy and not entry_stability.allows(prediction, direction, datetime.now().astimezone()):
+        value = prediction.get('entry_stability') or {}
+        report(f"Buy waiting: BTC stability {value.get('seconds', 0):.1f}s; requires {settings['entry_stability']['seconds']:g}s on the {direction} side of the target with fresh quotes.")
+        return False
     if not prediction.get("live_snapshot"):
         report("Waiting for a fresh Live recommendation before preparing the order.")
         return False
@@ -547,6 +672,39 @@ def prepare_contract_form(page, asset, start, end, get_prediction, report, recor
     if not side:
         report('Buy skipped: no valid contract side for the current direction.')
         return False
+    if effective_test_mode(prediction):
+        price = (prediction.get('contract_prices') or {}).get(
+            'yes_cents' if direction == 'UP / ABOVE' else 'no_cents')
+        if not isinstance(price, (int, float)) or isinstance(price, bool) or not min_price < price < max_price:
+            report('Test buy waiting: current quote must be inside the configured price range.')
+            return False
+        current = get_prediction(asset, start, end)
+        if not buy_prediction_matches(current, prediction, fb if fallback or force_buy else None, force_buy=force_buy):
+            return False
+        stamp = datetime.now().astimezone()
+        purchase = {
+            'status': 'attempted', 'test_mode': True, 'direction': direction,
+            'test_mode_reason': 'manual' if settings['test_mode'] else 'accuracy_pause',
+            'target': prediction['target'], 'contracts': int(contracts),
+            'limit_price_cents': price, 'execution_price_cents': price,
+            'attempted_at': stamp.isoformat(), 'submitted_at': stamp.isoformat(),
+            'purchase_minute': round((stamp-start).total_seconds()/60, 2),
+            'purchase_rule': 'force_buy' if force_buy else 'fallback' if fallback else 'primary',
+            'fallback_rule_number': fallback_index+1 if fallback else None,
+            'conditions': dict(settings, rule='force_buy' if force_buy else 'fallback' if fallback else 'primary'),
+            'live_recommendation': prediction['live_snapshot'],
+            'simulation_price_source': 'displayed_contract_quote',
+            'btc_price': prediction.get('brti_price'),
+        }
+        if not record_purchase or record_purchase(asset, start, end, purchase) is False:
+            return False
+        if record_purchase(asset, start, end, {
+                'target': prediction['target'], 'status': 'filled', 'test_mode': True,
+                'confirmed_by': 'simulation', 'filled_at': stamp.isoformat(),
+                'filled_quantity': int(contracts), 'receipt_contracts': int(contracts)}) is False:
+            return False
+        report(f'Test filled: {side}, {contracts} virtual contracts at {price:g}¢.')
+        return True
     target = read_event_target(page, asset, start, end)
     if target != prediction["target"]:
         raise ValueError('Browser target does not match the frozen prediction.')
@@ -571,8 +729,8 @@ def prepare_contract_form(page, asset, start, end, get_prediction, report, recor
         report('Buy waiting: purchase window closed while preparing the form.')
         return False
     current_prediction = get_prediction(asset, start, end)
-    if not buy_prediction_matches(current_prediction, prediction, fb if fallback or force_buy else None):
-        report(buy_prediction_change_reason(current_prediction, prediction))
+    if not buy_prediction_matches(current_prediction, prediction, fb if fallback or force_buy else None, force_buy=force_buy):
+        report(buy_prediction_change_reason(current_prediction, prediction, force_buy=force_buy))
         return False
     select_time_in_force(page, settings['time_in_force'])
     if quantity.count() != 1 or not quantity.is_visible() or not quantity.is_enabled():
@@ -580,7 +738,7 @@ def prepare_contract_form(page, asset, start, end, get_prediction, report, recor
         return False
     quantity.fill(contracts, timeout=3000)
     price = limit_cents(limit.input_value(timeout=3000) or limit.get_attribute('placeholder', timeout=3000) or '')
-    if not in_purchase_window(settings, start, end) or not min_price < price < max_price or not buy_prediction_matches(get_prediction(asset, start, end), prediction, fb if fallback or force_buy else None):
+    if not in_purchase_window(settings, start, end) or not min_price < price < max_price or not buy_prediction_matches(get_prediction(asset, start, end), prediction, fb if fallback or force_buy else None, force_buy=force_buy):
         clear_contract_quantity(quantity)
         report('Draft cleared because the price or round changed.')
         return False
@@ -591,8 +749,8 @@ def prepare_contract_form(page, asset, start, end, get_prediction, report, recor
         reason = 'Buy not submitted: purchase window closed while preparing the form.'
     elif not price_verified:
         reason = 'Buy not submitted: form limit price could not be verified.'
-    elif not buy_prediction_matches(current_prediction, prediction, fb if fallback or force_buy else None):
-        reason = buy_prediction_change_reason(current_prediction, prediction)
+    elif not buy_prediction_matches(current_prediction, prediction, fb if fallback or force_buy else None, force_buy=force_buy):
+        reason = buy_prediction_change_reason(current_prediction, prediction, force_buy=force_buy)
     if reason:
         clear_contract_quantity(quantity)
         report(reason)
@@ -620,13 +778,13 @@ def prepare_contract_form(page, asset, start, end, get_prediction, report, recor
                 "fallback_rule_number": fallback_index + 1 if fallback else None,
                 "fallback_brti_price": prediction.get("brti_price") if fallback else None,
                 "conditions": dict({key: settings[key] for key in
-                               ("min_price_cents", "max_price_cents", "contracts", "required_models", "agreement_basis", "purchase_minute_from", "purchase_minute_to", "time_in_force", "min_live_strength")}, contract_trend_changes=settings["contract_trend_changes"], contract_trend_method="linear_regression", rule="force_buy" if force_buy else "fallback" if fallback else "primary", fallback=settings["fallback"] if fallback else None, fallback_rule_number=fallback_index + 1 if fallback else None),
+                               ("min_price_cents", "max_price_cents", "contracts", "required_models", "agreement_basis", "purchase_minute_from", "purchase_minute_to", "time_in_force", "min_live_strength", "entry_stability")}, contract_trend_changes=settings["contract_trend_changes"], contract_trend_method="linear_regression", rule="force_buy" if force_buy else "fallback" if fallback else "primary", fallback=settings["fallback"] if fallback else None, fallback_rule_number=fallback_index + 1 if fallback else None),
                 "source_url": page.url,
                 "attempted_at": datetime.now().astimezone().isoformat(),
                 "live_recommendation": prediction["live_snapshot"]}
     if force_buy:
         purchase["conditions"]["force_buy"] = dict(settings["force_buy"])
-    if not in_purchase_window(settings, start, end) or not buy_prediction_matches(get_prediction(asset, start, end), prediction, fb if fallback or force_buy else None):
+    if not in_purchase_window(settings, start, end) or not buy_prediction_matches(get_prediction(asset, start, end), prediction, fb if fallback or force_buy else None, force_buy=force_buy):
         clear_contract_quantity(quantity)
         report('Buy review cancelled: purchase window, Live strength, direction or settings changed before submission.')
         page.reload(wait_until='domcontentloaded', timeout=60000)
@@ -638,6 +796,11 @@ def prepare_contract_form(page, asset, start, end, get_prediction, report, recor
         return False
     # Only journal an attempt once all review checks passed, just before Buy.
     snapshot = get_prediction(asset, start, end) or {}
+    if not buy_prediction_matches(snapshot, prediction, fb if fallback or force_buy else None, force_buy=force_buy):
+        clear_contract_quantity(quantity)
+        report(buy_prediction_change_reason(snapshot, prediction, force_buy=force_buy))
+        page.reload(wait_until='domcontentloaded', timeout=60000)
+        return False
     btc = snapshot.get('brti_price')
     valid_btc = (asset == 'BTC' and snapshot.get('target') == target
                  and isinstance(btc, (int, float)) and not isinstance(btc, bool)
@@ -778,7 +941,9 @@ def close_conditions_match(prediction, price_cents, start, end, now=None):
     if not prediction or start is None or end is None:
         return False
     purchase = prediction.get('purchase') or {}
-    if purchase.get('ignore_early_profit'):
+    if (purchase.get('ignore_early_profit')
+            or purchase.get('purchase_rule') == 'force_buy'
+            or (purchase.get('conditions') or {}).get('rule') == 'force_buy'):
         return False
     if purchase.get('status') != 'filled' or purchase.get('target') != prediction.get('target'):
         return False
@@ -802,7 +967,9 @@ def stop_loss_matches(prediction, price, start, end, now=None):
     if not prediction or start is None or end is None:
         return False
     purchase = prediction.get('purchase') or {}
-    if purchase.get('ignore_stop_loss'):
+    if (purchase.get('ignore_stop_loss')
+            or purchase.get('purchase_rule') == 'force_buy'
+            or (purchase.get('conditions') or {}).get('rule') == 'force_buy'):
         return False
     now = now or datetime.now().astimezone()
     if (purchase.get('status') != 'filled' or purchase.get('target') != prediction.get('target')
@@ -912,6 +1079,8 @@ def close_review_controls(page):
 
 def submit_close_review(page, asset, start, end, prediction, report, record_purchase, get_prediction, contracts=None, price=None):
     purchase = prediction.get('purchase') or {}
+    if purchase.get('test_mode') or (prediction.get('order_settings') or {}).get('test_mode'):
+        return False
     target = prediction['target']
     side = 'Yes' if purchase['direction'] == 'UP / ABOVE' else 'No'
     settings = trade_exit_settings(prediction)['close_conditions']
@@ -947,6 +1116,7 @@ def submit_close_review(page, asset, start, end, prediction, report, record_purc
                 r'(?:Immediate or cancel|IOC)' if settings['time_in_force'] == 'ioc'
                 else r'Good till date\b'), review_text, re.I)
             or not sale_conditions_match(current, price, start, end)
+            or (current.get('order_settings') or {}).get('test_mode')
             or current.get('purchase') != purchase):
         report('Close not submitted: review details or conditions changed.')
         return False
@@ -972,11 +1142,56 @@ def submit_close_review(page, asset, start, end, prediction, report, record_purc
     return True
 
 
+def prepare_virtual_close(asset, start, end, prediction, get_prediction, report, record_purchase):
+    """Simulate exits using displayed quotes, without touching broker controls."""
+    purchase = prediction['purchase']
+    if purchase.get('status') != 'filled' or purchase.get('close_order'):
+        return False
+    price = (prediction.get('contract_prices') or {}).get(
+        'yes_cents' if purchase['direction'] == 'UP / ABOVE' else 'no_cents')
+    if (not isinstance(price, (int, float)) or isinstance(price, bool)
+            or not math.isfinite(price) or not 0 < price <= 100):
+        return False
+    target = purchase['target']
+    peak = purchase.get('stop_loss_peak_bid_cents')
+    if peak is None or price > peak:
+        if record_purchase(asset, start, end, {'target': target,
+                'stop_loss_peak_bid_cents': price,
+                'stop_loss_peak_bid_at': datetime.now().astimezone().isoformat()}) is False:
+            return False
+        prediction = get_prediction(asset, start, end)
+        if not prediction:
+            return False
+    if not sale_conditions_match(prediction, price, start, end):
+        report(f'Test holding: virtual contract quote {price:g}¢; waiting for exit conditions.')
+        return False
+    stamp = datetime.now().astimezone().isoformat()
+    contracts = purchase['contracts']
+    closing = {'status': 'attempted', 'test_mode': True, 'contracts': contracts,
+               'direction': purchase['direction'], 'limit_price_cents': price,
+               'execution_price_cents': price, 'attempted_at': stamp,
+               'reason': 'force_close' if force_close_matches(prediction, price, start, end)
+                         else 'stop_loss' if stop_loss_matches(prediction, price, start, end)
+                         else 'close_conditions', 'simulation_price_source': 'displayed_contract_quote'}
+    if record_purchase(asset, start, end, {'target': target, 'close_order': closing}) is False:
+        return False
+    if record_purchase(asset, start, end, {'target': target, 'close_order': {
+            'status': 'filled', 'filled_at': stamp, 'confirmed_by': 'simulation',
+            'filled_quantity': contracts, 'receipt_contracts': contracts}}) is False:
+        return False
+    report(f'Test closed: {contracts} virtual contracts at {price:g}¢.')
+    return True
+
+
 def prepare_close_order(page, asset, start, end, get_prediction, report, record_purchase):
     prediction = get_prediction(asset, start, end)
     if not prediction:
         return False
     purchase = prediction.get('purchase') or {}
+    if purchase.get('test_mode'):
+        return prepare_virtual_close(asset, start, end, prediction, get_prediction, report, record_purchase)
+    if (prediction.get('order_settings') or {}).get('test_mode'):
+        return False
     if purchase.get('close_order'):
         if purchase['close_order'].get('status') == 'filled':
             return False
@@ -1095,6 +1310,58 @@ def prepare_close_order(page, asset, start, end, get_prediction, report, record_
                                record_purchase, get_prediction, contracts, price)
 
 
+def clear_cancelled_ioc(page, asset, start, end, get_prediction, record_purchase, report):
+    """Release only a verified zero-fill IOC after the confirmation window."""
+    prediction = get_prediction(asset, start, end) or {}
+    purchase = prediction.get('purchase') or {}
+    pending = (purchase.get('status') == 'cancelled'
+               and purchase.get('cancellation_reason') == 'ioc_cancelled_unfilled'
+               and purchase.get('ioc_cleanup_pending'))
+    if not pending:
+        if (purchase.get('status') not in ('attempted', 'submitted')
+                or purchase.get('test_mode')
+                or purchase.get('direction') not in ('UP / ABOVE', 'DOWN / BELOW')
+                or (purchase.get('conditions') or {}).get('time_in_force') != 'ioc'):
+            return False
+        try:
+            stamps = [datetime.fromisoformat(purchase[key]) for key in ('attempted_at', 'submitted_at') if purchase.get(key)]
+            if not stamps or (datetime.now().astimezone()-max(stamps)).total_seconds() < 10:
+                return False
+        except (ValueError, TypeError):
+            return False
+        if observe_filled_order(page, asset, start, end, record_purchase):
+            return False
+        text = page.locator('body').inner_text(timeout=5000)
+        terminal = re.search(r'(?im)^\s*(?:Order(?: status)?\s*:?\s*)?(?:cancelled|canceled|expired|rejected)[.!]?\s*$', text)
+        quantities = re.findall(r'\bFilled quantity\s*:?\s*(\d+)\s+of\s+(\d+)\b', text, re.I)
+        side = 'Yes' if purchase.get('direction') == 'UP / ABOVE' else 'No'
+        labels = re.findall(r'\b(Yes|No)\s*[·•]\s*\$([\d,]+(?:\.\d+)?)\s+or above', normalize_event_text(text), re.I)
+        expected = (side.lower(), purchase.get('target'))
+        if (not terminal or quantities != [('0', str(purchase.get('contracts')))]
+                or {(s.lower(), float(t.replace(',', ''))) for s, t in labels} != {expected}
+                or read_event_target(page, asset, start, end) != purchase.get('target')):
+            return False
+        if not record_purchase(asset, start, end, {
+                'status': 'cancelled', 'target': purchase['target'],
+                'cancellation_reason': 'ioc_cancelled_unfilled',
+                'cancellation_scope': 'exchange_confirmed',
+                'cancelled_at': datetime.now().astimezone().isoformat(),
+                'expected_attempted_at': purchase.get('attempted_at'),
+                'expected_submitted_at': purchase.get('submitted_at'),
+                'filled_quantity': 0, 'receipt_contracts': purchase['contracts'],
+                'confirmed_by': 'visible_cancelled_ioc_receipt', 'ioc_cleanup_pending': True}):
+            return False
+    # Refresh before releasing the record: an old receipt must not be reused.
+    page.reload(wait_until='domcontentloaded', timeout=60000)
+    if not record_purchase(asset, start, end, {
+            'target': purchase['target'], 'expected_attempted_at': purchase.get('attempted_at'),
+            'expected_submitted_at': purchase.get('submitted_at'),
+            'ioc_cleanup_refreshed_at': datetime.now().astimezone().isoformat()}):
+        return False
+    report('IOC cancelled with zero filled contracts; cleared the app purchase record after 10 seconds. New buys can qualify again.')
+    return True
+
+
 def expire_unconfirmed_attempt(page, asset, start, end, get_prediction, record_purchase, report):
     prediction = get_prediction(asset, start, end)
     purchase = (prediction or {}).get('purchase') or {}
@@ -1206,6 +1473,10 @@ def browser_loop(stop, snapshot, accept, report, get_prediction, record_purchase
                 if page.is_closed():
                     report('Robinhood browser was closed. Restart the app to reopen it.')
                     break
+                if login_required(page.locator('body').inner_text(timeout=5000)):
+                    report('Robinhood login required: the app browser is signed out. Sign in using the app browser profile to resume contract prices.')
+                    stop.wait(5)
+                    continue
                 if record_balance:
                     record_balance(read_available_balance(page))
                 key = (asset, start)
@@ -1227,6 +1498,11 @@ def browser_loop(stop, snapshot, accept, report, get_prediction, record_purchase
                         record_prices(asset, start, end, None, None)
                 if has_target:
                     current = get_prediction(asset, start, end)
+                    if clear_cancelled_ioc(page, asset, start, end, get_prediction, record_purchase, report):
+                        prepared = None
+                        refreshed = get_prediction(asset, start, end) or {}
+                        refreshed_removal = (*key, refreshed.get('purchase_removal_revision', 0), None)
+                        continue
                     removal = refresh_removed_purchase(page, current, key, refreshed_removal, report)
                     if removal != refreshed_removal:
                         refreshed_removal = removal
@@ -1237,9 +1513,9 @@ def browser_loop(stop, snapshot, accept, report, get_prediction, record_purchase
                     if prepare_close_order(page, asset, start, end, get_prediction, report, record_purchase):
                         stop.wait(0.5)
                         continue
-                    if current and current.get('purchase_exists') and observe_filled_order(page, asset, start, end, record_purchase):
+                    if current and current.get('purchase_exists') and not (current.get('purchase') or {}).get('test_mode') and observe_filled_order(page, asset, start, end, record_purchase):
                         prepared = key
-                    if current and current.get('purchase_exists'):
+                    if current and current.get('purchase_exists') and not (current.get('purchase') or {}).get('test_mode'):
                         observe_owned_contracts(page, asset, start, end, record_purchase)
                     if current and current.get('purchase_exists'):
                         # Keep the close diagnostic visible instead of replacing

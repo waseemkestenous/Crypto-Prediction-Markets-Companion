@@ -60,7 +60,7 @@ Stop with Ctrl+C.
 
 import argparse
 import threading
-from brti_website import read_live_brti, MAX_QUOTE_AGE_SECONDS, SOURCE_POLL_INTERVAL_SECONDS
+from brti_website import read_live_brti, MAX_QUOTE_AGE_SECONDS, SOURCE_POLL_INTERVAL_SECONDS, HTML_FALLBACK_POLL_INTERVAL_SECONDS
 import json
 import math
 import os
@@ -420,10 +420,10 @@ class BenchmarkSource:
                                               snapshot['fetched_at'],'Live rendered website')
         with self._brti_lock:
             tick = time.monotonic()
-            if self._last_html_check is not None and tick-self._last_html_check < SOURCE_POLL_INTERVAL_SECONDS:
+            if self._last_html_check is not None and tick-self._last_html_check < HTML_FALLBACK_POLL_INTERVAL_SECONDS:
                 if self.last_quote_at is not None and 0 <= (datetime.now(timezone.utc)-self.last_quote_at).total_seconds() <= MAX_QUOTE_AGE_SECONDS:
                     return self.last_quote_value
-                raise RuntimeError(f'Waiting for the next {SOURCE_POLL_INTERVAL_SECONDS}-second BRTI source check; no fresh quote available.')
+                raise RuntimeError(f'Waiting for the next {HTML_FALLBACK_POLL_INTERVAL_SECONDS}-second BRTI source check; no fresh quote available.')
             self._last_html_check = tick
         response = SESSION.get(
             CF_BRTI_URL, timeout=10,

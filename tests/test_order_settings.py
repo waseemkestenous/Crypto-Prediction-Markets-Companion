@@ -179,6 +179,7 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(purchase['conditions'],{
                 'min_price_cents':20,'max_price_cents':60,'contracts':2,
                 'required_models':list(settings.MODEL_NAMES),'agreement_basis':'either',
+                'entry_stability':dict(settings.ENTRY_STABILITY_DEFAULTS),
                 'purchase_minute_from':0,'purchase_minute_to':15,'contract_trend_changes':10,'contract_trend_method':'linear_regression','min_live_strength':'MODERATE','rule':'primary','fallback':None,'fallback_rule_number':None,'time_in_force':'ioc'})
             with patch.dict(app.ORDER_SETTINGS,min_price_cents=40,required_models=[]):
                 self.assertEqual(journal.load('BTC')[0]['purchase']['conditions']['min_price_cents'],20)

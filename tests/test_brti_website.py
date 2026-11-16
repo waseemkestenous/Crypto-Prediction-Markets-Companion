@@ -64,3 +64,24 @@ class BrtiWebsiteTests(unittest.TestCase):
                 else:
                     with self.assertRaises(RuntimeError):
                         source._accept_brti_snapshot(81000,stamp,clock.now.return_value,'website')
+
+    def test_reader_polls_rendered_page_every_half_second(self):
+        from email.utils import format_datetime
+        reader=website.LiveWebsiteReader()
+        reader.stop=Mock()
+        reader.stop.is_set.side_effect=[False,True]
+        now=datetime.now(timezone.utc)
+        page,browser,playwright,context=Mock(),Mock(),Mock(),Mock()
+        context.__enter__=Mock(return_value=playwright)
+        context.__exit__=Mock(return_value=False)
+        playwright.chromium.launch.return_value=browser
+        browser.new_page.return_value=page
+        page.locator.return_value.inner_text.return_value=(
+            'CME CF Bitcoin Real Time Index BRTI $81,636.96\nLast updated: '+format_datetime(now))
+        with patch('playwright.sync_api.sync_playwright',return_value=context):
+            reader.run()
+        self.assertTrue(reader.ready.is_set())
+        self.assertEqual(reader.snapshot['value'],81636.96)
+        reader.stop.wait.assert_called_once_with(.5)
+        browser.close.assert_called_once()
+        page.reload.assert_not_called()

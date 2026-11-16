@@ -1,0 +1,492 @@
+{
+  "cutoff": "2026-11-03T00:00:00-06:00",
+  "asof": "2026-11-06T00:42:11.850954-06:00",
+  "methodology": "Production BTC target strict crossing count with causal 15-second sampling; gaps skipped. Trigger >6 means >=7. Immediate scheduled next round, including no buys. Actual filled trade net P/L summed by successor round. No settings or trading changes.",
+  "journal_sha256": "41883a93715e0ee3af30c797c821b41766751af40abf3e4ecbfe8f58d3c39b84",
+  "high": {
+    "rounds": 38,
+    "outcomes": {
+      "win": 13,
+      "no_buy": 22,
+      "loss": 3
+    },
+    "loss_rate": 0.1875,
+    "net": 3.4556,
+    "trades": 16,
+    "winning_trades": 13,
+    "losing_trades": 3
+  },
+  "comparison_at_most_6": {
+    "rounds": 215,
+    "outcomes": {
+      "missing_round": 1,
+      "no_buy": 118,
+      "loss": 41,
+      "win": 54,
+      "pending_round": 1
+    },
+    "loss_rate": 0.43157894736842106,
+    "net": -12.173,
+    "trades": 96,
+    "winning_trades": 55,
+    "losing_trades": 41
+  },
+  "daily": {
+    "2026-11-03": {
+      "rounds": 13,
+      "outcomes": {
+        "win": 8,
+        "no_buy": 3,
+        "loss": 2
+      },
+      "loss_rate": 0.2,
+      "net": 1.5872,
+      "trades": 10,
+      "winning_trades": 8,
+      "losing_trades": 2
+    },
+    "2026-11-04": {
+      "rounds": 16,
+      "outcomes": {
+        "win": 3,
+        "loss": 1,
+        "no_buy": 12
+      },
+      "loss_rate": 0.25,
+      "net": 1.1572,
+      "trades": 4,
+      "winning_trades": 3,
+      "losing_trades": 1
+    },
+    "2026-11-05": {
+      "rounds": 9,
+      "outcomes": {
+        "no_buy": 7,
+        "win": 2
+      },
+      "loss_rate": 0.0,
+      "net": 0.7112,
+      "trades": 2,
+      "winning_trades": 2,
+      "losing_trades": 0
+    }
+  },
+  "high_pairs": [
+    {
+      "trigger_start": "2026-11-03T05:45:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-03T06:00:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 0.4506,
+          "direction": "UP / ABOVE",
+          "contracts": 1
+        }
+      ],
+      "net": 0.4506,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-03T06:45:00-06:00",
+      "trigger_crossings": 8,
+      "next_start": "2026-11-03T07:00:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-03T08:45:00-06:00",
+      "trigger_crossings": 12,
+      "next_start": "2026-11-03T09:00:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 0.3012,
+          "direction": "UP / ABOVE",
+          "contracts": 1
+        }
+      ],
+      "net": 0.3012,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-03T09:00:00-06:00",
+      "trigger_crossings": 11,
+      "next_start": "2026-11-03T09:15:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 0.4506,
+          "direction": "DOWN / BELOW",
+          "contracts": 1
+        }
+      ],
+      "net": 0.4506,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-03T11:30:00-06:00",
+      "trigger_crossings": 10,
+      "next_start": "2026-11-03T11:45:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": -0.6394,
+          "direction": "UP / ABOVE",
+          "contracts": 1
+        }
+      ],
+      "net": -0.6394,
+      "outcome": "loss"
+    },
+    {
+      "trigger_start": "2026-11-03T11:45:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-03T12:00:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-03T13:00:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-03T13:15:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 0.3606,
+          "direction": "UP / ABOVE",
+          "contracts": 1
+        }
+      ],
+      "net": 0.3606,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-03T13:45:00-06:00",
+      "trigger_crossings": 12,
+      "next_start": "2026-11-03T14:00:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 0.1812,
+          "direction": "UP / ABOVE",
+          "contracts": 1
+        }
+      ],
+      "net": 0.1812,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-03T14:30:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-03T14:45:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 0.3806,
+          "direction": "UP / ABOVE",
+          "contracts": 1
+        }
+      ],
+      "net": 0.3806,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-03T15:00:00-06:00",
+      "trigger_crossings": 9,
+      "next_start": "2026-11-03T15:15:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": -0.6194,
+          "direction": "UP / ABOVE",
+          "contracts": 1
+        }
+      ],
+      "net": -0.6194,
+      "outcome": "loss"
+    },
+    {
+      "trigger_start": "2026-11-03T15:15:00-06:00",
+      "trigger_crossings": 8,
+      "next_start": "2026-11-03T15:30:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 0.3606,
+          "direction": "UP / ABOVE",
+          "contracts": 1
+        }
+      ],
+      "net": 0.3606,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-03T18:00:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-03T18:15:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 0.3606,
+          "direction": "DOWN / BELOW",
+          "contracts": 1
+        }
+      ],
+      "net": 0.3606,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-03T23:00:00-06:00",
+      "trigger_crossings": 8,
+      "next_start": "2026-11-03T23:15:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-04T00:30:00-06:00",
+      "trigger_crossings": 8,
+      "next_start": "2026-11-04T00:45:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 1.1118,
+          "direction": "UP / ABOVE",
+          "contracts": 3
+        }
+      ],
+      "net": 1.1118,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-04T02:15:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-04T02:30:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 0.5136,
+          "direction": "UP / ABOVE",
+          "contracts": 3
+        }
+      ],
+      "net": 0.5136,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-04T05:30:00-06:00",
+      "trigger_crossings": 11,
+      "next_start": "2026-11-04T05:45:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": -0.6594,
+          "direction": "UP / ABOVE",
+          "contracts": 1
+        }
+      ],
+      "net": -0.6594,
+      "outcome": "loss"
+    },
+    {
+      "trigger_start": "2026-11-04T07:15:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-04T07:30:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-04T09:15:00-06:00",
+      "trigger_crossings": 8,
+      "next_start": "2026-11-04T09:30:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-04T10:45:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-04T11:00:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-04T11:45:00-06:00",
+      "trigger_crossings": 8,
+      "next_start": "2026-11-04T12:00:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-04T12:15:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-04T12:30:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-04T12:30:00-06:00",
+      "trigger_crossings": 8,
+      "next_start": "2026-11-04T12:45:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-04T13:00:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-04T13:15:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-04T15:45:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-04T16:00:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-04T18:15:00-06:00",
+      "trigger_crossings": 13,
+      "next_start": "2026-11-04T18:30:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 0.1912,
+          "direction": "UP / ABOVE",
+          "contracts": 1
+        }
+      ],
+      "net": 0.1912,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-04T19:00:00-06:00",
+      "trigger_crossings": 24,
+      "next_start": "2026-11-04T19:15:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-04T20:15:00-06:00",
+      "trigger_crossings": 11,
+      "next_start": "2026-11-04T20:30:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-04T21:00:00-06:00",
+      "trigger_crossings": 8,
+      "next_start": "2026-11-04T21:15:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-04T22:15:00-06:00",
+      "trigger_crossings": 10,
+      "next_start": "2026-11-04T22:30:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-05T08:00:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-05T08:15:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-05T11:45:00-06:00",
+      "trigger_crossings": 8,
+      "next_start": "2026-11-05T12:00:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-05T12:30:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-05T12:45:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-05T12:45:00-06:00",
+      "trigger_crossings": 9,
+      "next_start": "2026-11-05T13:00:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-05T17:30:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-05T17:45:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 0.3706,
+          "direction": "UP / ABOVE",
+          "contracts": 1
+        }
+      ],
+      "net": 0.3706,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-05T19:00:00-06:00",
+      "trigger_crossings": 7,
+      "next_start": "2026-11-05T19:15:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-05T19:45:00-06:00",
+      "trigger_crossings": 14,
+      "next_start": "2026-11-05T20:00:00-06:00",
+      "high": true,
+      "trades": [
+        {
+          "pnl": 0.3406,
+          "direction": "UP / ABOVE",
+          "contracts": 1
+        }
+      ],
+      "net": 0.3406,
+      "outcome": "win"
+    },
+    {
+      "trigger_start": "2026-11-05T20:00:00-06:00",
+      "trigger_crossings": 10,
+      "next_start": "2026-11-05T20:15:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    },
+    {
+      "trigger_start": "2026-11-05T20:15:00-06:00",
+      "trigger_crossings": 8,
+      "next_start": "2026-11-05T20:30:00-06:00",
+      "high": true,
+      "trades": [],
+      "outcome": "no_buy"
+    }
+  ]
+}

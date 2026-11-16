@@ -123,6 +123,21 @@ class NavigationTests(unittest.TestCase):
                  datetime.fromisoformat('2026-10-11T01:15:00-05:00'))
         self.assertEqual(target, 82963.62)
 
+    def test_plain_text_market_title_and_actionable_quote(self):
+        from datetime import datetime
+        self.page.set_content("""<h1>Robinhood</h1>
+          <div>BTC 15 min · 9:15–9:30 PM EST</div>
+          <div>$73,346.95 or above 44¢</div>
+          <section>Select a contract <div>$73,346.95 or above 46¢</div></section>
+          <p>Event day November 10, 2026</p>""")
+        start=datetime.fromisoformat('2026-11-10T20:15:00-06:00')
+        end=datetime.fromisoformat('2026-11-10T20:30:00-06:00')
+        target=rh.read_event_target(self.page,'BTC',start,end)
+        self.assertEqual(target,73346.95)
+        self.assertEqual(rh.parse_contract_prices(self.page.locator('body').inner_text(),target)['yes_cents'],46)
+        with self.assertRaisesRegex(ValueError,'does not match app round'):
+            rh.read_event_target(self.page,'BTC',start.replace(minute=0),end.replace(minute=15))
+
     def test_no_banner_refreshes_same_event(self):
         self.content = '<p>Target price: TBD or above</p>'
         self.page.goto('http://events.test/old')

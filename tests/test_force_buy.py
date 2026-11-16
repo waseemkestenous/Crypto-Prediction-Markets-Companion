@@ -10,14 +10,14 @@ import round_history
 
 
 class ForceBuyTests(unittest.TestCase):
-    def form(self,requested=True,enabled=True,brti=None,threshold=None,price=50,minute=3,direction='DOWN / BELOW'):
+    def form(self,requested=True,enabled=True,brti=None,threshold=None,price=50,minute=3,direction='DOWN / BELOW',stability=False):
         now=datetime.now().astimezone();start=now-timedelta(minutes=minute);end=start+timedelta(minutes=15)
         rule=dict(settings.FORCE_BUY_DEFAULTS,enabled=enabled,contracts=2,min_price_cents=40,max_price_cents=60,
                   min_distance_dollars=threshold,time_in_force='good_till_date')
         p={'direction':'UP / ABOVE','target':83000,'live_direction':direction,
            'live_snapshot':{'direction':direction,'confidence':.7},'brti_price':brti,
            'purchase_exists':False,'force_buy_request':'request' if requested else None,
-           'order_settings':dict(settings.DEFAULTS,force_buy=rule)}
+           'order_settings':dict(settings.DEFAULTS,force_buy=rule,entry_stability={'enabled':stability,'seconds':60})}
         key='yes_cents' if direction=='UP / ABOVE' else 'no_cents';other='no_cents' if key=='yes_cents' else 'yes_cents'
         p['contract_price_history']=[{'target':83000,'observed_at':(start+timedelta(seconds=i)).isoformat(),key:price-.1+i*.01,other:101-price+.1-i*.01} for i in range(11)]
         p['contract_prices']={key:price,other:101-price}
@@ -39,6 +39,11 @@ class ForceBuyTests(unittest.TestCase):
         self.assertEqual(purchase['contracts'],2)
         self.assertEqual(purchase['conditions']['time_in_force'],'good_till_date')
         tif.assert_called_once_with(unittest.mock.ANY,'good_till_date')
+
+    def test_force_buy_bypasses_enabled_stability_without_btc_history(self):
+        result,record,_,_=self.form(stability=True)
+        self.assertTrue(result)
+        self.assertFalse(record.call_args_list[0].args[3]['conditions']['entry_stability']['enabled'])
 
     def test_no_auto_buy_and_strict_bounds(self):
         for options in ({'requested':False},{'enabled':False},{'price':40},{'price':60},

@@ -174,9 +174,9 @@ without a snapshot show Conditions not recorded.
 CURRENT CONTRACT QUOTES
 All automatic purchases, including fallback rules, now require the purchased
 side's overall price trend over the configured number of distinct changes to
-be upward. Set Trend changes under Buy conditions and Save; the default is 10
-changes (11 quotes). N changes require N+1 quotes. The setting applies to both
-primary and fallback rules and is saved with each purchase. A least-squares line is fitted to price against observation time;
+be upward. Set Changes under Trade Conditions and Save; the default is 10
+changes (11 quotes). N changes require N+1 quotes. Each FB rule has its own Changes setting, initially inherited from the shared
+value for existing rules, and the effective value is saved with each purchase. A least-squares line is fitted to price against observation time;
 its slope must be positive. Individual downward changes are allowed.
 Yes is checked for Up; the estimated No quote is checked for Down. Unchanged
 quotes do not count. Missing history, a stale current quote, or a flat/downward overall trend
@@ -346,7 +346,8 @@ close attempts/submissions are observed rather than submitted again. Save applie
 the edited threshold; the drop is cents per contract and excludes fees.
 
 MINIMUM LIVE STRENGTH
-Buy conditions includes Live strength >=, default MODERATE. A fresh Live minute
+Trade Conditions includes Strength >=, default MODERATE. Each FB rule has its
+own Strength setting; existing rules initially inherit the shared value. A fresh Live minute
 recommendation must meet this minimum for both primary and fallback purchases,
 regardless of the selected prediction agreement basis. MODERATE and STRONG qualify
 at the default; weaker or missing/nonfinite confidence blocks buying. The level
@@ -609,3 +610,145 @@ The rolling BTC/cent calculation uses a moving window without changing the
 estimator or its quality gates. Source polling and quote-age limits are unchanged.
 Restart the server and refresh browser tabs to load these changes.
 Measured local results and methodology are in reports/runtime_performance.json.
+
+SYSTEMD SERVICE (THIS CHECKOUT)
+The installed user service is BTCTargetPulse.service. Its source is deploy/BTCTargetPulse.service;
+paths in that file target /home/waseem/repo/trading/predict/cpmc1.
+It uses .venv/bin/python and runs Chrome headless with the existing Robinhood
+profile. The dashboard remains on port 8000. Do not also run app.py manually.
+
+This single service starts the dashboard, live price source, history refresh,
+prediction/learning workers, and Robinhood target/order browser together.
+The obsolete cpmc-local-price.service and cpmc-local-target.timer are disabled:
+they referenced the removed /home/waseem/cpmc checkout and are not dependencies
+of this application.
+
+  systemctl --user status BTCTargetPulse.service
+  systemctl --user restart BTCTargetPulse.service
+  systemctl --user stop BTCTargetPulse.service
+  systemctl --user start BTCTargetPulse.service
+  journalctl --user -u BTCTargetPulse.service -f
+
+The service is enabled under default.target and user lingering is enabled for
+waseem, so it starts at boot without login and survives logout. Restart=always
+restarts an exited process after 5 seconds; an explicit systemctl stop keeps it
+stopped. To disable automatic startup:
+
+  systemctl --user disable --now BTCTargetPulse.service
+
+After changing the unit file:
+
+  cp deploy/BTCTargetPulse.service ~/.config/systemd/user/BTCTargetPulse.service
+  systemctl --user daemon-reload
+  systemctl --user restart BTCTargetPulse.service
+
+For manual Robinhood login, stop this service first, run
+.venv/bin/python robinhood_target.py --login from a graphical session, close
+that browser after login, then start the service again.
+
+LEARNING FROM NEW SETTLED ROUNDS
+Frozen Decision now evaluates an additional recorded-round probability calibrator
+before publishing each new round. It uses up to 300 past settled rounds for the
+same asset, with one example per round and the four recorded model probabilities.
+Unsettled, current/future, inconsistent, incomplete, and duplicate rounds do not
+inflate the training set. The original frozen probability and the evaluation
+summary are journaled as frozen_learning so later training avoids applying the
+same calibration repeatedly. Existing frozen decisions are never rewritten.
+
+Live learning now prefers pre-learning probabilities actually recorded in each
+round's .live.jsonl log; older missing observations fall back to historical replay.
+Only records at or before the sampled observation, within 20 seconds and with a
+matching target, qualify. Reports count recorded and replayed examples separately.
+The Live learner retrains in the background each round; Frozen trains once when
+the round prediction is generated. Both remain independent evaluations.
+
+Both learners require at least 40 usable rounds, reserve the newest 30 percent
+for chronological validation (at least 10 rounds), and blend a candidate by 25%.
+Activation requires Brier improvement greater than .002, lower log loss, and no
+accuracy decrease. Otherwise the candidate remains shadow-only and the baseline
+is retained. The dashboard shows learning status and baseline/candidate holdout
+accuracy on both cards. Holdout results describe probability/direction accuracy,
+not execution quality or trading profit. No improvement is guaranteed.
+
+Force Buy positions never use automatic Close all or Stop loss, even when enabled.
+Explicitly requested Force Close remains available.
+
+BTC PRICE UPDATE LATENCY
+The shared rendered BRTI page and BTC live worker are checked every 0.5 seconds.
+Dashboard state refreshes every 0.5 seconds with overlapping requests prevented.
+This reduces local detection/display delay; it does not change how often the
+upstream BRTI website publishes a new quote. The 20-second source freshness
+limit remains unchanged. HTML fallback requests remain limited to every 2 seconds.
+
+Test mode (virtual trading)
+---------------------------
+In Trade Conditions, enable Test mode and save the settings. Entries follow the
+same primary, fallback, and Force Buy conditions, but no broker order controls
+are used. Virtual trades are recorded as filled, marked TEST / Virtual, and
+closed under the configured exit conditions or settled at round end. Prices
+use displayed contract quotes (the No quote can be estimated), and P/L uses
+the existing estimated fees. These are simulated fills, not actual executions.
+Virtual holdings remain virtual after disabling Test mode. While Test mode is
+on, existing live holdings are not automatically closed by the app.
+
+Test mode permits virtual buys while the Final prediction accuracy filter
+pauses real buys. Other entry conditions and the choppiness guard still apply.
+
+Automatic test mode on accuracy pause
+When the Final prediction accuracy pause is enabled and its guard pauses real
+buys, new entries automatically become virtual even if Test mode is unchecked.
+When the guard allows buys again, new entries return to the saved Test mode
+setting. Existing virtual positions always close virtually. Other entry gates
+remain active. The accuracy status displays Automatic test mode while paused.
+
+BTC entry stability (Trade Conditions)
+The optional global "Require BTC on buy side of target" condition defaults to
+off, with a 60-second duration. It applies to Primary and every Fallback,
+including virtual entries. Force Buy bypasses this stability condition. A buy requires observed BTC prices strictly on the bought
+side of the round target for the configured duration. Touching/crossing the
+target or a quote gap above 10 seconds resets the timer. The elapsed duration
+uses source observation timestamps, not time spent waiting without quotes.
+Fresh BRTI on that same side is required; missing data blocks entries while the
+condition is enabled. It is rechecked during preparation and before submission.
+The condition and duration are saved with each purchase. Existing exits do not
+use this gate. This condition does not add a minimum dollar distance.
+
+CRYPTO.COM FIVE-MINUTE BTC COMPANION
+Open /crypto-com from the dashboard header. This separate page polls the public
+Crypto.com Exchange BTC_USD ticker and contract quotes every second; one-minute candles
+refresh once a minute. Exchange prices are explicitly a proxy;
+they are not verified Predict settlement or contract quotes. Quotes older than
+20 seconds disable prediction. The target is read automatically using a dedicated persistent Chrome profile
+(.crypto-com-browser), matching the Robinhood browser approach. The reader verifies
+the LIVE heading, dated market link, and countdown against the current five-minute
+interval in America/New_York. Automatic targets take priority over manual input,
+remain fixed through temporary read failures, and are cleared at rollover.
+Manual fallback input is bound to one round. A second tab follows the verified
+current market URL and reads the visible Yes/No buttons in cents. Quote target,
+URL and round must match; quotes older than 15 seconds are hidden. Target and
+both contract prices are shown as separate dashboard cards. The browser starts when the new
+page is first polled and uses the application --headless option.
+The experimental empirical bootstrap samples contiguous pre-round minute returns
+for the remaining horizon; it does not reuse the Robinhood 15-minute prediction
+or its accuracy statistics. Probabilities have not been backtested/calibrated.
+Public Predict target reading has been verified live in visible and headless
+Chrome. Order-form preparation is not implemented; authentication and the form
+still need verification. This page never fills or submits orders.
+Restart app.py to load the new routes. Tests: python -m unittest tests.test_crypto_predict tests.test_crypto_website
+The Crypto.com page shares /dashboard.css with the Robinhood dashboard, including
+its compact cards, header countdown and two-column monitor layout. Its chart shows
+BTC/USD, target and the Yes contract on separate price scales. The market history
+table contains only observations collected while this page is open; it is not
+purchase history or settled-round accuracy. Chart lines can be toggled separately.
+
+IOC ZERO-FILL RETRY
+After a saved IOC buy has waited at least 10 seconds, the browser checks for a
+terminal canceled/expired/rejected receipt with Filled quantity 0 of the saved
+quantity, matching contract side, target and current round. A full fill takes
+priority. Once zero-fill cancellation is verified, the browser refreshes and
+archives/removes the app purchase record (the same retry eligibility as the X
+control), retaining its details. The normal entry conditions are evaluated again.
+Elapsed time alone never proves cancellation: uncertain receipts, partial fills,
+GTD orders and virtual orders are not cleared by this rule. Failed refreshes keep
+the purchase blocking retries until the refresh succeeds. Attempt/submission
+identity is rechecked by the backend before either state transition.

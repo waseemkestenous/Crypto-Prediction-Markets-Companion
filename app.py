@@ -10,9 +10,14 @@ import gzip
 from pathlib import Path
 import robinhood_target
 import round_history
+import choppiness
 import price_history
+import prospective_study
+import entry_stability
+import logging
 import buy_analysis
 import live_learning
+import frozen_learning
 import live_market_support
 import order_settings
 import order_logs
@@ -140,6 +145,7 @@ def prediction_to_json(p):
         "confidence": round(p["confidence"] * 100.0, 2),
         "strength": p["strength"],
         "agreement": p["component_agreement"],
+        "learning": p.get("frozen_learning"),
         "models": models,
         "backtest": {
             "rounds": bt["rounds"],
@@ -183,10 +189,27 @@ def recommendation_to_json(rec):
     }
 
 
+_DASHBOARD_STATS_CACHE = {}
+
+
+def dashboard_stats_json():
+    """Reuse display-only aggregates for one second; trade guards stay live."""
+    key = (ARGS.asset, round_history.ROOT, dt_iso(STATE['round_start']),
+           json.dumps(ORDER_SETTINGS, sort_keys=True), stats_json)
+    now = time.monotonic()
+    if (_DASHBOARD_STATS_CACHE.get('key') != key
+            or now - _DASHBOARD_STATS_CACHE['updated_at'] >= 1):
+        value = stats_json()
+        _DASHBOARD_STATS_CACHE.update(key=key, value=value, updated_at=time.monotonic())
+    return _DASHBOARD_STATS_CACHE['value']
+
+
 def stats_json():
     records = round_history.merged(ARGS.asset, STATS.get("rounds", []), include_quotes=False)
     stats = round_history.purchase_accuracy(records)
     stats["final_prediction"] = round_history.final_prediction_accuracy(records)
+    stats["buy_accuracy_guard"] = round_history.accuracy_buy_guard(records, ORDER_SETTINGS, now_local())
+    stats["buy_choppiness_guard"] = current_buy_choppiness_guard(include_current=True)
     stats["balance"] = round_history.balance_summary(records, ORDER_SETTINGS.get("initial_balance", 0))
     return stats
 
@@ -328,6 +351,9 @@ def analyze_target(target, round_start, round_end, token, quality="MANUAL Robinh
             args=ARGS,
         )
 
+        prediction = frozen_learning.apply(prediction,
+            round_history.load(ARGS.asset, include_quotes=False), ARGS.asset, core.confidence_strength)
+
         with LOCK:
             if token != globals()["ANALYSIS_TOKEN"]:
                 return
@@ -349,7 +375,7 @@ def analyze_target(target, round_start, round_end, token, quality="MANUAL Robinh
                           p_up=prediction["p_up"], p_down=prediction["p_down"],
                           component_results=components,
                           adaptive_weights={key: item["weight"] for key, item in prediction.get("adaptive_weights", {}).items()},
-                          target_quality=quality, error=None)
+                          target_quality=quality, frozen_learning=prediction.get("frozen_learning"), error=None)
 
     except Exception as exc:
         with LOCK:
@@ -410,6 +436,43 @@ def accept_robinhood_target(target, asset, start, end, url):
     return True
 
 
+def current_buy_accuracy_guard():
+    if not ORDER_SETTINGS.get('accuracy_buy_guard', {}).get('enabled'):
+        return {'enabled': False, 'allowed': True}
+    records = round_history.merged(ARGS.asset, STATS.get('rounds', []), include_quotes=False)
+    return round_history.accuracy_buy_guard(records, ORDER_SETTINGS, now_local())
+
+
+def round_choppiness(asset, start, end, asof, source):
+    if source == 'bitcoin':
+        row = round_history.get('BTC', start.isoformat(), include_quotes=False) or {}
+        return price_history.round_choppiness(start, end, asof, row.get('target'))
+    if source == 'contract_yes':
+        return round_history.contract_round_choppiness(asset, start, end, asof)
+    raise ValueError('Choppiness source must be bitcoin or contract_yes.')
+
+
+def current_buy_choppiness_guard(include_current=False):
+    config = dict(order_settings.CHOPPINESS_BUY_GUARD_DEFAULTS, **ORDER_SETTINGS.get('choppiness_buy_guard', {}))
+    if not any(config.get(key) for key in ('enabled', 'current_enabled', 'block_next_round')) and not include_current:
+        return {'enabled': False, 'allowed': True}
+    now = now_local()
+    start, end = core.current_round(now)
+    scores = []
+    # Exactly the last N consecutive completed rounds, including unbought ones.
+    # Do not skip a missing round or use an older round in its place.
+    for lag in range(config.get('rounds', 3)):
+        previous_end = start - timedelta(minutes=15 * lag)
+        previous_start = previous_end - timedelta(minutes=15)
+        scores.append(round_choppiness(ARGS.asset, previous_start, previous_end, now, config['source']))
+    current = round_choppiness(ARGS.asset, start, end, now, config['source'])
+    guard = choppiness.buy_guard(scores, config, current)
+    guard['blocked_until'] = dt_iso(end) if not guard['allowed'] else None
+    if include_current:
+        guard['current_round'] = current
+    return guard
+
+
 def robinhood_form_prediction(asset, start, end):
     with LOCK:
         prediction = STATE["prediction"]
@@ -446,6 +509,7 @@ def robinhood_form_prediction(asset, start, end):
         return {"direction": prediction["prediction"], "target": STATE["target"],
                 "model_directions": directions, "live_direction": live_direction,
                 "live_snapshot": live_snapshot, "brti_price": brti,
+                "entry_stability": entry_stability.measure(STATE["underlying_prices"], start, end, now_local(), STATE["target"]),
                 "contract_price_history": current_contract_price_history(start),
                 "contract_prices": current_contract_prices(start),
                 "purchase_exists": bool(row.get("purchase")) and (
@@ -454,6 +518,8 @@ def robinhood_form_prediction(asset, start, end):
                 "purchase": dict(row.get('purchase') or {}),
                 "force_buy_request": current_force_buy_request(asset, start, end),
                 "purchase_removal_revision": row.get('purchase_removal_revision', 0),
+                "buy_accuracy_guard": current_buy_accuracy_guard(),
+                "buy_choppiness_guard": current_buy_choppiness_guard(),
                 "order_settings": dict(ORDER_SETTINGS)}
 
 
@@ -479,12 +545,52 @@ def record_robinhood_purchase(asset, start, end, purchase):
 
 def _record_robinhood_purchase(asset, start, end, purchase):
     with LOCK:
+        if purchase.get('status') == 'attempted':
+            guard = current_buy_accuracy_guard()
+            virtual_attempt = purchase.get('test_mode') is True and robinhood_target.effective_test_mode(
+                {'order_settings': ORDER_SETTINGS, 'buy_accuracy_guard': guard})
+            if not virtual_attempt and not guard['allowed']:
+                return False
+        if purchase.get('status') == 'attempted' and not current_buy_choppiness_guard()['allowed']:
+            return False
         existing = round_history.get(asset,dt_iso(start))
         if not existing:
             return False
         if existing.get("purchase_removed") and purchase.get('status') != 'attempted':
             return True
         old = existing.get("purchase") or {}
+        if purchase.get('cancellation_reason') == 'ioc_cancelled_unfilled':
+            if (old.get('status') not in ('attempted', 'submitted') or old.get('test_mode')
+                    or (old.get('conditions') or {}).get('time_in_force') != 'ioc'
+                    or old.get('target') != purchase.get('target')
+                    or old.get('attempted_at') != purchase.get('expected_attempted_at')
+                    or old.get('submitted_at') != purchase.get('expected_submitted_at')
+                    or purchase.get('filled_quantity') != 0
+                    or purchase.get('receipt_contracts') != old.get('contracts')
+                    or purchase.get('confirmed_by') != 'visible_cancelled_ioc_receipt'):
+                return False
+            try:
+                stamps = [datetime.fromisoformat(old[key]) for key in ('attempted_at','submitted_at') if old.get(key)]
+                if not stamps or (now_local()-max(stamps)).total_seconds() < 10:
+                    return False
+            except (ValueError, TypeError):
+                return False
+            update = {key:value for key,value in purchase.items() if not key.startswith('expected_')}
+            round_history.upsert(asset,dt_iso(start),dt_iso(end),purchase=dict(old,**update))
+            return True
+        if 'ioc_cleanup_refreshed_at' in purchase:
+            if (old.get('status') != 'cancelled' or old.get('cancellation_reason') != 'ioc_cancelled_unfilled'
+                    or old.get('target') != purchase.get('target')
+                    or old.get('attempted_at') != purchase.get('expected_attempted_at')
+                    or old.get('submitted_at') != purchase.get('expected_submitted_at')):
+                return False
+            archived = dict(old, ioc_cleanup_pending=False,
+                            ioc_cleanup_refreshed_at=purchase['ioc_cleanup_refreshed_at'])
+            round_history.upsert(asset,dt_iso(start),dt_iso(end),purchase=None,
+                purchase_removed=True,removed_purchase=archived,
+                purchase_removal_revision=existing.get('purchase_removal_revision',0)+1)
+            _DASHBOARD_STATS_CACHE.clear()
+            return True
         if purchase.get('cancellation_reason') == 'attempt_confirmation_timeout':
             if (old.get('status') != 'attempted' or old.get('target') != purchase.get('target')
                     or old.get('attempted_at') != purchase.get('expected_attempted_at')):
@@ -519,8 +625,12 @@ def _record_robinhood_purchase(asset, start, end, purchase):
                 return False
             closing = purchase['close_order']
             if closing.get('status') == 'attempted' and (
-                    closing.get('reason') == 'stop_loss' and old.get('ignore_stop_loss')
-                    or closing.get('reason') == 'close_conditions' and old.get('ignore_early_profit')):
+                    closing.get('reason') == 'stop_loss' and (
+                        old.get('ignore_stop_loss') or old.get('purchase_rule') == 'force_buy'
+                        or (old.get('conditions') or {}).get('rule') == 'force_buy')
+                    or closing.get('reason') == 'close_conditions' and (
+                        old.get('ignore_early_profit') or old.get('purchase_rule') == 'force_buy'
+                        or (old.get('conditions') or {}).get('rule') == 'force_buy')):
                 return False
             previous = old.get('close_order') or {}
             if previous.get('status') == 'filled':
@@ -653,8 +763,12 @@ def record_contract_prices(asset, start, end, target, prices):
                     if round_history.crossed_above_50(previous.get(side + '_cents'), sample[side + '_cents']):
                         fields[f'last_{side}_cross_50_at'] = dt_iso(stamp)
                         fields[f'last_{side}_cross_50_minute'] = round((stamp-start).total_seconds()/60, 2)
-                if not samples or any(samples[-1].get(key) != sample[key]
-                                      for key in ("target", "yes_cents", "no_cents")):
+                # Retain an unchanged quote periodically too: scoring at fixed
+                # instants must distinguish a flat market from missing data.
+                heartbeat = (not samples or (stamp - datetime.fromisoformat(samples[-1]['observed_at'])).total_seconds()
+                             >= choppiness.SAMPLE_SECONDS)
+                if heartbeat or any(samples[-1].get(key) != sample[key]
+                                    for key in ("target", "yes_cents", "no_cents")):
                     samples.append(sample)
                     fields["contract_price_history"] = samples
             for side, key in (("up", "yes_cents"), ("down", "no_cents")):
@@ -853,6 +967,12 @@ def live_worker():
                 with LOCK:
                     if STATE["prediction"] is prediction:
                         price_history.append_live(ARGS.asset,current_start,recommendation)
+                        try:
+                            prospective_study.append(ARGS.asset,current_start,prospective_study.snapshot(
+                                current_start,round_end,now,STATE['target'],underlying,
+                                current_contract_prices(current_start),prediction,recommendation,dict(ORDER_SETTINGS)))
+                        except Exception:
+                            logging.getLogger(__name__).exception('Research snapshot could not be saved')
                         record_live_recommendation(recommendation)
                         STATE["live_recommendation"] = recommendation
                         STATE["recommendation_minute"] = minute_key
@@ -862,7 +982,7 @@ def live_worker():
                 round_end - now
             ).total_seconds() if round_end else 999
 
-            interval = 1.0 if seconds_left <= 65 else (core.SOURCE_POLL_INTERVAL_SECONDS if SOURCE.mode == 'cfbenchmarks' else 3.0)
+            interval = core.SOURCE_POLL_INTERVAL_SECONDS if SOURCE.mode == 'cfbenchmarks' else (1.0 if seconds_left <= 65 else 3.0)
             if live_recommendation is not None:
                 recommendation_age = (
                     now - live_recommendation["updated_at"]
@@ -954,7 +1074,8 @@ def api_state():
             live_delta = live - target
             live_delta_pct = live_delta / target * 100.0
 
-        current_purchase = ((round_history.get(ARGS.asset, dt_iso(start)) or {}).get('purchase') or {}) if start else {}
+        current_trade_row = (round_history.get(ARGS.asset, dt_iso(start), include_quotes=False) or {}) if start else {}
+        current_purchase = current_trade_row.get('purchase') or {}
         pending_close = current_purchase.get('close_order') or {}
         manual_close = ({'asset': ARGS.asset, 'round_start': dt_iso(start),
                          'purchase_token': current_purchase.get('attempted_at') or current_purchase.get('submitted_at') or '',
@@ -962,6 +1083,12 @@ def api_state():
                         if current_purchase.get('status') == 'filled' and pending_close.get('status') in ('attempted', 'submitted') else None)
         payload = {
             "manual_close": manual_close,
+            "chart_trades": {"round_start": dt_iso(start), "round_end": dt_iso(end),
+                            "prediction": current_trade_row.get("prediction") or (p or {}).get("prediction"),
+                            "p_up": current_trade_row.get("p_up", (p or {}).get("p_up")),
+                            "actual": current_trade_row.get("actual"), "status": current_trade_row.get("status"),
+                            "purchase": current_purchase,
+                            "completed_purchases": current_trade_row.get("completed_purchases") or []},
             "server_time": dt_iso(now),
             "asset": ARGS.asset,
             "supported_assets": sorted(core.ASSET_CONFIGS),
@@ -987,6 +1114,8 @@ def api_state():
             "contract_prices": current_contract_prices(start),
             "contract_price_history": current_contract_price_history(start),
             "underlying_price_history": list(STATE["underlying_prices"]),
+            "live_recommendation_changes": price_history.live_changes(ARGS.asset, start, end),
+            "entry_stability": entry_stability.measure(STATE["underlying_prices"], start, end, now, target),
             "available_balance": current_available_balance(),
             "target_quality": STATE["target_quality"],
             "order_settings": dict(ORDER_SETTINGS),
@@ -1017,7 +1146,7 @@ def api_state():
             "live_recommendation": recommendation_to_json(
                 STATE["live_recommendation"]
             ),
-            "stats": stats_json(),
+            "stats": dashboard_stats_json(),
             "latest_settlement": STATE["latest_settlement"],
             "warning": (
                 f"Live source: {SOURCE.label}. Historical data uses an exchange proxy. "
@@ -1037,6 +1166,13 @@ def open_purchase_pnl(row, now):
     result = {'status':'unavailable','net_pnl':None}
     with LOCK:
         quote = dict(STATE.get('holding_quote') or {})
+        if purchase.get('test_mode'):
+            prices = dict(STATE.get('contract_prices') or {})
+            quote = dict(prices, direction=purchase.get('direction'),
+                         purchase_token=purchase.get('attempted_at') or purchase.get('submitted_at'),
+                         bid_cents=prices.get('yes_cents' if purchase.get('direction') == 'UP / ABOVE' else 'no_cents'))
+    if purchase.get('target') != row.get('target'):
+        return result
     if (quote.get('asset') != row.get('asset') or quote.get('round_start') != row['round_start']
             or quote.get('target') != row.get('target') or quote.get('direction') != purchase.get('direction')
             or quote.get('purchase_token') != (purchase.get('attempted_at') or purchase.get('submitted_at'))):
@@ -1052,7 +1188,8 @@ def open_purchase_pnl(row, now):
     if pnl is None:
         return result
     return {'status':'winning' if pnl > 0 else 'losing' if pnl < 0 else 'breakeven',
-            'net_pnl':pnl,'bid_cents':quote['bid_cents'],'updated_at':quote['updated_at']}
+            'net_pnl':pnl,'bid_cents':quote['bid_cents'],'updated_at':quote['updated_at'],
+            'price_source':'displayed_contract_quote' if purchase.get('test_mode') else 'held_side_bid'}
 
 
 @app.get("/api/round-history")
@@ -1064,6 +1201,7 @@ def api_round_history():
     with LOCK:
         asset = ARGS.asset
         rows = round_history.merged(asset, STATS.get("rounds", []), include_quotes=False)
+        chop_source = ORDER_SETTINGS.get('choppiness_buy_guard', {}).get('source', 'bitcoin')
     try:
         date_from = datetime.strptime(request.args['date_from'], '%Y-%m-%d').date() if request.args.get('date_from') else None
         date_to = datetime.strptime(request.args['date_to'], '%Y-%m-%d').date() if request.args.get('date_to') else None
@@ -1125,6 +1263,9 @@ def api_round_history():
         stored=round_history.get(asset,row['round_start']) or {}
         row['contract_price_history']=stored.get('contract_price_history',row.get('contract_price_history',[]))
         row['underlying_price_history']=price_history.load(asset,datetime.fromisoformat(row['round_start']),datetime.fromisoformat(row['round_end']))
+        row['live_recommendation_changes']=price_history.live_changes(asset,datetime.fromisoformat(row['round_start']),datetime.fromisoformat(row['round_end']))
+        row['choppiness'] = round_choppiness(
+            asset, datetime.fromisoformat(row['round_start']), datetime.fromisoformat(row['round_end']), cutoff, chop_source)
     return jsonify({"asset": asset, "server_time":dt_iso(cutoff), "page": page, "pages": pages, "total": len(rows),
                     "stats": filtered_stats, "rounds": page_rows})
 
@@ -1312,6 +1453,17 @@ def api_order_settings():
         if isinstance(data, dict) and 'initial_balance' not in data:
             with LOCK:
                 data = dict(data, initial_balance=ORDER_SETTINGS.get('initial_balance', 0))
+        if isinstance(data, dict) and 'test_mode' not in data:
+            with LOCK:
+                data = dict(data, test_mode=ORDER_SETTINGS.get('test_mode', False))
+        if isinstance(data, dict) and isinstance(data.get('choppiness_buy_guard'), dict):
+            with LOCK:
+                # Older open pages must not erase newly configured gates.
+                existing = ORDER_SETTINGS.get('choppiness_buy_guard', {})
+                additions = {key: existing.get(key, order_settings.CHOPPINESS_BUY_GUARD_DEFAULTS[key])
+                             for key in ('current_enabled', 'current_limit', 'block_next_round')
+                             if key not in data['choppiness_buy_guard']}
+                data = dict(data, choppiness_buy_guard=dict(data['choppiness_buy_guard'], **additions))
         settings = order_settings.validate(data)
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -1444,6 +1596,11 @@ def api_asset():
 @app.get("/")
 def home():
     return Response(HTML, mimetype="text/html")
+
+
+@app.get("/dashboard.css")
+def dashboard_styles():
+    return Response(HTML.split('<style>', 1)[1].split('</style>', 1)[0], mimetype="text/css")
 
 
 HTML = r'''<!doctype html>
@@ -1738,13 +1895,16 @@ button:disabled{opacity:.45;cursor:not-allowed}
 #orderSettingsPanel{--condition-indent:19px}
 #orderSettingsPanel .force-buy-inputs,#orderSettingsPanel .stop-loss-row,#orderSettingsPanel .fallback-exit-row{padding-left:var(--condition-indent)}
 #orderSettingsPanel .force-buy-inputs>.contract-field:first-child,#orderSettingsPanel .stop-loss-row>.contract-field:first-child,#orderSettingsPanel .fallback-exit-row>.contract-field:first-child{margin-left:calc(-1 * var(--condition-indent))}
+#orderSettingsPanel .choppiness-inputs{padding-left:var(--condition-indent)}
+#orderSettingsPanel .choppiness-inputs>.contract-field:first-child{margin-left:calc(-1 * var(--condition-indent))}
+#orderSettingsPanel .choppiness-round-controls>.contract-field:first-child{margin-left:calc(-1 * var(--condition-indent))}
 #orderSettingsPanel .contract-field,#orderSettingsPanel .purchase-minute-group{gap:6px;max-width:100%}
 #orderSettingsPanel .purchase-filter-sides{margin:0;gap:12px 16px;align-items:center}
 #orderSettingsPanel .purchase-agreement-side{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 #orderSettingsPanel .purchase-agreement-side>label{display:inline;margin:0;white-space:nowrap}
 #orderSettingsPanel .purchase-model-options{margin-top:0;gap:8px 12px;min-height:30px;font-size:12px;line-height:1.35}
 #orderSettingsPanel .purchase-model-options label{display:inline-flex;align-items:center;margin:0;gap:6px;line-height:1.35}
-#orderSettingsPanel .fallback-models{flex-basis:100%;gap:8px 12px;font-size:11px}
+#orderSettingsPanel .fallback-models{flex-basis:auto;gap:8px 12px;font-size:11px}
 #orderSettingsPanel .purchase-input-row input[type=number]{width:40px;height:30px;box-sizing:border-box;padding:4px}
 #orderSettingsPanel input[type=checkbox]{width:13px;height:13px;margin:0;flex-shrink:0;vertical-align:middle}
 #orderSettingsPanel select{height:30px;box-sizing:border-box;padding:4px 6px;font-size:12px;border-radius:8px}
@@ -1921,35 +2081,31 @@ button:disabled{opacity:.45;cursor:not-allowed}
 
     <div class="card span12">
       <details class="order-conditions" id="orderSettingsPanel"><summary>Trade Conditions</summary>
+      <label><input id="testModeInput" type="checkbox" onchange="orderSettingsDirty=true"> Test mode — virtual orders only (estimated fills and fees)</label>
+      <div class="muted">When the accuracy pause is enabled and accuracy is below its limit, buys automatically become virtual even with Test mode off. Real buys resume when accuracy recovers.</div>
       <div class="contract-settings">
       <div class="primary-rule">
       <details class="fallback-details primary-details">
       <summary><input id="primaryEnabledInput" type="checkbox" checked aria-label="Primary" onclick="event.stopPropagation()" onchange="orderSettingsDirty=true"><span class="fallback-header-text"></span></summary>
       <div class="fallback-content primary-content">
-      <div class="purchase-input-row">
-      <label class="contract-field" for="minPriceInput">Price &gt; (¢) <input id="minPriceInput" type="number" min="0" max="99.99" step="0.01" oninput="orderSettingsDirty=true;updatePrimarySummary()"></label>
-      <label class="contract-field" for="maxPriceInput">Price &lt; (¢) <input id="maxPriceInput" type="number" min="0.01" max="100" step="0.01" oninput="orderSettingsDirty=true;updatePrimarySummary()"></label>
-      <label class="contract-field" for="contractsInput">CTs <input id="contractsInput" type="number" min="1" step="1" oninput="orderSettingsDirty=true;updatePrimarySummary()"></label>
-      <div class="purchase-minute-group"><span>Minute</span>
-      <label class="contract-field" for="purchaseMinuteFromInput">From <input id="purchaseMinuteFromInput" type="number" min="0" max="15" step="0.1" oninput="orderSettingsDirty=true;updatePrimarySummary()"></label>
+      <div class="purchase-input-row primary-entry-inputs">
+      <label class="contract-field" for="purchaseMinuteFromInput">Min From <input id="purchaseMinuteFromInput" type="number" min="0" max="15" step="0.1" oninput="orderSettingsDirty=true;updatePrimarySummary()"></label>
       <label class="contract-field" for="purchaseMinuteToInput">To <input id="purchaseMinuteToInput" type="number" min="0" max="15" step="0.1" oninput="orderSettingsDirty=true;updatePrimarySummary()"></label>
-      </div>
-      </div>
-      <div class="purchase-conditions">
-        <div class="purchase-filter-sides">
-        <div class="purchase-agreement-side">
+      <label class="contract-field" for="minPriceInput">Price &gt; ¢ <input id="minPriceInput" type="number" min="0" max="99.99" step="0.01" oninput="orderSettingsDirty=true;updatePrimarySummary()"></label>
+      <label class="contract-field" for="maxPriceInput">&lt; ¢ <input id="maxPriceInput" type="number" min="0.01" max="100" step="0.01" oninput="orderSettingsDirty=true;updatePrimarySummary()"></label>
+      <label class="contract-field" for="contractsInput">CTs <input id="contractsInput" type="number" min="1" step="1" oninput="orderSettingsDirty=true;updatePrimarySummary()"></label>
+      <label class="contract-field" for="contractTrendChangesInput" title="Number of distinct price changes used to calculate the overall upward trend; N changes require N+1 quotes">Changes <input id="contractTrendChangesInput" type="number" min="1" step="1" value="10" oninput="orderSettingsDirty=true"></label>
+      <div class="purchase-agreement-side">
         <label for="agreementBasisInput">Agree with</label>
         <select id="agreementBasisInput" onchange="orderSettingsDirty=true"><option value="final">Final Prediction</option><option value="live">Current Prediction</option><option value="either">Final or Current Prediction</option><option value="both">Final and Current Prediction</option></select>
         </div>
-        <div class="purchase-model-side">
-        <div class="purchase-model-options">
+      <label class="contract-field" for="minLiveStrengthInput">Strength ≥ <select id="minLiveStrengthInput" onchange="orderSettingsDirty=true"><option>EXTREMELY WEAK</option><option>VERY WEAK</option><option>WEAK</option><option selected>MODERATE</option><option>STRONG</option></select></label>
+      <div class="purchase-model-options">
         <span>With Models :</span>
         <label><input type="checkbox" name="requiredModel" value="Pattern" checked onchange="orderSettingsDirty=true"> Pattern</label>
         <label><input type="checkbox" name="requiredModel" value="Recent" checked onchange="orderSettingsDirty=true"> Recent</label>
         <label><input type="checkbox" name="requiredModel" value="Bootstrap" checked onchange="orderSettingsDirty=true"> Bootstrap</label>
         <label><input type="checkbox" name="requiredModel" value="Trend" checked onchange="orderSettingsDirty=true"> Trend</label>
-        </div>
-        </div>
         </div>
       </div>
       <div id="primaryExitRules"></div>
@@ -1959,8 +2115,25 @@ button:disabled{opacity:.45;cursor:not-allowed}
       <div id="fallbackRules"></div>
       <div class="purchase-input-row purchase-trend-row">
       <label class="contract-field">Buy Time in force <select id="timeInForceInput" onchange="orderSettingsDirty=true"><option value="ioc">Immediate or cancel (IOC)</option><option value="good_till_date">Good till date</option></select></label>
-      <label class="contract-field" for="contractTrendChangesInput" title="Number of distinct price changes used to calculate the overall upward trend; N changes require N+1 quotes">Trend changes <input id="contractTrendChangesInput" type="number" min="1" step="1" value="10" oninput="orderSettingsDirty=true"></label>
-      <label class="contract-field" for="minLiveStrengthInput">Live strength ≥ <select id="minLiveStrengthInput" onchange="orderSettingsDirty=true"><option>EXTREMELY WEAK</option><option>VERY WEAK</option><option>WEAK</option><option selected>MODERATE</option><option>STRONG</option></select></label>
+      </div>
+      <div class="purchase-input-row" title="Applies to Primary and Fallback, including virtual buys. Force Buy bypasses this condition. BTC must stay strictly on the purchased side of the target. Touches, crossings and quote gaps over 10 seconds reset the timer.">
+        <label class="contract-field"><input id="entryStabilityEnabled" type="checkbox" style="width:auto" onchange="orderSettingsDirty=true">Require BTC on buy side of target for</label>
+        <label class="contract-field"><input id="entryStabilitySeconds" aria-label="Minimum BTC stability seconds" type="number" min="0.1" max="900" step="any" value="60" oninput="orderSettingsDirty=true">seconds before Primary / Fallback buys</label><span id="entryStabilityStatus" class="muted"></span>
+      </div>
+      <div class="purchase-input-row"><label class="contract-field"><input id="accuracyBuyGuardEnabled" type="checkbox" style="width:auto" onchange="orderSettingsDirty=true">Pause buys if Final prediction accuracy &lt;</label><label class="contract-field"><input id="accuracyBuyGuardMinInput" type="number" min="0" max="100" step="0.1" value="60" oninput="orderSettingsDirty=true">%</label><label class="contract-field">over last <input id="accuracyBuyGuardHoursInput" type="number" min="0.01" max="8760" step="any" value="24" oninput="orderSettingsDirty=true">hours</label><span id="accuracyBuyGuardStatus" class="muted"></span></div>
+      <div class="purchase-input-row choppiness-inputs" title="Score = number of midpoint crossings in 15-second samples: Yes crosses 50 cents; Bitcoin crosses this round target. First observed side and exact touches do not count. Gaps are ignored; at least four sampled prices are needed. Uses exactly the last N completed rounds, including unbought rounds. Current score is provisional. The average filter pauses buys if required round scores are missing. Current/following-round filters act on observed crossings. Range is shown separately and does not gate buying.">
+        <label class="contract-field"><input id="choppinessBuyGuardEnabled" type="checkbox" style="width:auto" onchange="orderSettingsDirty=true">Pause buys if average midpoint crossings &gt;</label>
+        <label class="contract-field"><input id="choppinessBuyGuardMaxInput" aria-label="Maximum average midpoint crossings" type="number" min="0" step="any" value="3" oninput="orderSettingsDirty=true"></label>
+        <label class="contract-field">over last <input id="choppinessBuyGuardRoundsInput" aria-label="Completed rounds for midpoint crossings" type="number" min="1" max="96" step="1" value="3" oninput="orderSettingsDirty=true">completed rounds</label>
+        <label class="contract-field">Source <select id="choppinessBuyGuardSourceInput" onchange="orderSettingsDirty=true"><option value="bitcoin">Bitcoin (BTC)</option><option value="contract_yes">Contract Yes</option></select></label>
+        <div class="purchase-input-row choppiness-round-controls" title="Pause new buys for the rest of the current round once this observed crossing count is reached. Uses the selected source, including Force Buy.">
+          <label class="contract-field"><input id="choppinessCurrentEnabled" type="checkbox" onchange="orderSettingsDirty=true">Pause current round at ≥</label>
+          <label class="contract-field"><input id="choppinessCurrentLimitInput" aria-label="Current-round midpoint crossing limit" type="number" min="1" max="59" step="1" value="7" oninput="orderSettingsDirty=true">crossings</label>
+        </div>
+        <div class="purchase-input-row choppiness-round-controls" title="If the immediately previous round reached this limit, block new buys for this whole round. Resets on the next round; repeats only if another round also reaches the limit. Existing exit conditions continue working.">
+          <label class="contract-field"><input id="choppinessBlockNextInput" type="checkbox" onchange="orderSettingsDirty=true">Block following round after this limit is reached</label>
+        </div>
+        <span id="choppinessBuyGuardStatus" class="muted" style="flex-basis:100%;white-space:normal;flex-shrink:1"></span>
       </div>
       <div class="purchase-input-row"><label class="contract-field"><input id="allowMultiBuyInput" type="checkbox" style="width:auto" onchange="orderSettingsDirty=true">Allow multiple buys in the same round after full close</label></div>
       <div class="purchase-input-row fallback-inputs force-buy-inputs">
@@ -2118,6 +2291,8 @@ function readFallbackRules(){
       const value=row.querySelector(`[data-field="${key}"]`).value;
       rule[key]=key==='min_distance_dollars'&&value.trim()===''?null:Number(value);
     }
+    rule.contract_trend_changes=Number(row.querySelector('[data-field="contract_trend_changes"]').value);
+    rule.min_live_strength=row.querySelector('[data-field="min_live_strength"]').value;
     Object.assign(rule,readTradeExits(row));
     Object.defineProperty(rule,'_collapsed',{value:!row.querySelector('.fallback-details').open});
     rule.required_models=Array.from(row.querySelectorAll('[data-model]:checked'),input=>input.dataset.model);
@@ -2159,6 +2334,8 @@ function renderFallbackRules(rules){
   document.getElementById('fallbackRules').innerHTML=rules.map((rule,index)=>`
     <div class="fallback-rule" data-trade-name="FB${index+1}"><details class="fallback-details" ${(rule._collapsed??collapsed[index]??true)?'':'open'}><summary><input data-field="enabled" type="checkbox" aria-label="Enable fallback ${index+1}" ${rule.enabled?'checked':''} onclick="event.stopPropagation()" onchange="orderSettingsDirty=true"><span class="fallback-header-text">${renderTradeHeader("FB"+(index+1),rule)}</span></summary><div class="fallback-content"><div class="purchase-input-row fallback-inputs">
       ${fallbackFields.map(([key,label])=>`<label class="contract-field">${label}<input data-field="${key}" type="number" ${key==='min_distance_dollars'?'':'min="0"'} step="${key==='contracts'?'1':'.01'}" value="${key==='min_distance_dollars'&&rule[key]===null?'':Number(rule[key])}" ${key==='min_distance_dollars'?'placeholder="Off" title="Leave blank to disable the BRTI distance condition"':''} oninput="orderSettingsDirty=true;updateFallbackSummary(this)"></label>`).join('')}
+      <label class="contract-field">Changes <input data-field="contract_trend_changes" type="number" min="1" step="1" value="${rule.contract_trend_changes??document.getElementById('contractTrendChangesInput').value}" oninput="orderSettingsDirty=true"></label>
+      <label class="contract-field">Strength ≥ <select data-field="min_live_strength" onchange="orderSettingsDirty=true">${['EXTREMELY WEAK','VERY WEAK','WEAK','MODERATE','STRONG'].map(value=>`<option ${(rule.min_live_strength??document.getElementById('minLiveStrengthInput').value)===value?'selected':''}>${value}</option>`).join('')}</select></label>
       <div class="fallback-models" role="group" aria-label="Fallback ${index+1} model agreement filters">
         <span>With Models :</span>
         ${['Pattern','Recent','Bootstrap','Trend'].map(name=>`<label class="contract-field"><input type="checkbox" data-model="${name}" ${(rule.required_models||[]).includes(name)?'checked':''} onchange="orderSettingsDirty=true">${name}</label>`).join('')}
@@ -2187,15 +2364,18 @@ function moveFallbackRule(index,delta){
 async function saveOrderSettings(){
   const status=document.getElementById("orderSettingsStatus");
   const button=document.getElementById("saveOrderSettingsBtn");
+  const test_mode=document.getElementById("testModeInput").checked;
   const primary_enabled=document.getElementById("primaryEnabledInput").checked;
   const min_price_cents=Number(document.getElementById("minPriceInput").value);
   const max_price_cents=Number(document.getElementById("maxPriceInput").value);
   const purchase_minute_from=Number(document.getElementById("purchaseMinuteFromInput").value);
   const purchase_minute_to=Number(document.getElementById("purchaseMinuteToInput").value);
   const contracts=Number(document.getElementById("contractsInput").value);
+  const entry_stability={enabled:document.getElementById('entryStabilityEnabled').checked,seconds:Number(document.getElementById('entryStabilitySeconds').value)};
+  if(!Number.isFinite(entry_stability.seconds)||entry_stability.seconds<=0||entry_stability.seconds>900){status.textContent='Entry stability seconds must be greater than 0 and at most 900.';return;}
   const min_live_strength=document.getElementById("minLiveStrengthInput").value;
   const contract_trend_changes=Number(document.getElementById('contractTrendChangesInput').value);
-  if(!Number.isSafeInteger(contract_trend_changes)||contract_trend_changes<1){status.textContent='Trend changes must be a positive whole number.';return;}
+  if(!Number.isSafeInteger(contract_trend_changes)||contract_trend_changes<1){status.textContent='Changes must be a positive whole number.';return;}
   if(!Number.isFinite(min_price_cents)||min_price_cents<0||min_price_cents>=max_price_cents||!Number.isFinite(max_price_cents)||max_price_cents<=0||max_price_cents>100||!Number.isSafeInteger(contracts)||contracts<1){
     status.textContent="Enter a minimum price of 0 or more, a maximum above it and up to 100 cents, and a positive whole number of contracts.";
     return;
@@ -2206,6 +2386,10 @@ async function saveOrderSettings(){
   const required_models=Array.from(document.querySelectorAll('input[name="requiredModel"]:checked'),input=>input.value);
   const agreement_basis=document.getElementById("agreementBasisInput").value;
   const fallbacks=readFallbackRules();
+  const accuracy_buy_guard={enabled:document.getElementById('accuracyBuyGuardEnabled').checked,min_accuracy_pct:Number(document.getElementById('accuracyBuyGuardMinInput').value),window_hours:Number(document.getElementById('accuracyBuyGuardHoursInput').value)};
+  const choppiness_buy_guard={enabled:document.getElementById('choppinessBuyGuardEnabled').checked,max_score:Number(document.getElementById('choppinessBuyGuardMaxInput').value),rounds:Number(document.getElementById('choppinessBuyGuardRoundsInput').value),source:document.getElementById('choppinessBuyGuardSourceInput').value,metric:'midpoint_crossings',current_enabled:document.getElementById('choppinessCurrentEnabled').checked,current_limit:Number(document.getElementById('choppinessCurrentLimitInput').value),block_next_round:document.getElementById('choppinessBlockNextInput').checked};
+  if(!Number.isSafeInteger(choppiness_buy_guard.current_limit)||choppiness_buy_guard.current_limit<1||choppiness_buy_guard.current_limit>59){status.textContent='Current-round crossing limit must be a whole number from 1 to 59.';return;}
+  if(document.getElementById('choppinessBuyGuardMaxInput').value.trim()===''||!Number.isFinite(choppiness_buy_guard.max_score)||choppiness_buy_guard.max_score<0||!Number.isSafeInteger(choppiness_buy_guard.rounds)||choppiness_buy_guard.rounds<1||choppiness_buy_guard.rounds>96){status.textContent='Maximum average crossings must be non-negative and completed rounds a whole number from 1 to 96.';return;}
   const allow_multi_buy=document.getElementById('allowMultiBuyInput').checked;
   const time_in_force=document.getElementById('timeInForceInput').value;
   const {stop_loss,close_conditions}=readTradeExits(document.getElementById('primaryExitRules'));
@@ -2218,7 +2402,7 @@ async function saveOrderSettings(){
   const force_close={enabled:document.getElementById('forceCloseEnabled').checked,min_price_cents:Number(document.getElementById('forceCloseMinPriceInput').value),max_brti_delta_dollars:document.getElementById('forceCloseBrtiDeltaInput').value.trim()===''?null:Number(document.getElementById('forceCloseBrtiDeltaInput').value),minute_from:Number(document.getElementById('forceCloseMinuteFromInput').value),minute_to:Number(document.getElementById('forceCloseMinuteToInput').value),time_in_force:document.getElementById('forceCloseTimeInForceInput').value};
   button.disabled=true;
   try{
-    const response=await fetch("/api/order-settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({primary_enabled,min_live_strength,stop_loss,force_close,force_buy,contract_trend_changes,time_in_force,allow_multi_buy,close_conditions,fallbacks,purchase_minute_from,purchase_minute_to,min_price_cents,max_price_cents,contracts,required_models,agreement_basis})});
+    const response=await fetch("/api/order-settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({entry_stability,test_mode,choppiness_buy_guard,accuracy_buy_guard,primary_enabled,min_live_strength,stop_loss,force_close,force_buy,contract_trend_changes,time_in_force,allow_multi_buy,close_conditions,fallbacks,purchase_minute_from,purchase_minute_to,min_price_cents,max_price_cents,contracts,required_models,agreement_basis})});
     const data=await response.json();
     if(!response.ok||!data.ok) throw new Error(data.error||"Could not save settings");
     orderSettingsDirty=false;
@@ -2370,6 +2554,7 @@ function syncOrderSettings(s){
   const settingsKey=JSON.stringify(s.order_settings);
   if(s.order_settings&&!settingsFocused&&(!orderSettingsLoaded||!orderSettingsDirty)
       &&(!orderSettingsLoaded||settingsKey!==renderedOrderSettings)){
+    document.getElementById("testModeInput").checked=s.order_settings.test_mode===true;
     document.getElementById("primaryEnabledInput").checked=s.order_settings.primary_enabled!==false;
     document.getElementById("purchaseMinuteFromInput").value=s.order_settings.purchase_minute_from??0;
     document.getElementById("purchaseMinuteToInput").value=s.order_settings.purchase_minute_to??15;
@@ -2378,12 +2563,24 @@ function syncOrderSettings(s){
     document.getElementById("contractsInput").value=s.order_settings.contracts;
     document.getElementById('primaryExitRules').innerHTML=renderFallbackExit('close_conditions',s.order_settings.close_conditions)+renderFallbackExit('stop_loss',s.order_settings.stop_loss);
     updatePrimarySummary();
+    document.getElementById('entryStabilityEnabled').checked=s.order_settings.entry_stability?.enabled??false;
+    document.getElementById('entryStabilitySeconds').value=s.order_settings.entry_stability?.seconds??60;
     document.getElementById("minLiveStrengthInput").value=s.order_settings.min_live_strength||"MODERATE";
     document.getElementById("contractTrendChangesInput").value=s.order_settings.contract_trend_changes??10;
     document.getElementById("agreementBasisInput").value=s.order_settings.agreement_basis||"either";
     const required=s.order_settings.required_models||["Pattern","Recent","Bootstrap","Trend"];
     document.querySelectorAll('input[name="requiredModel"]').forEach(input=>{input.checked=required.includes(input.value);});
     renderFallbackRules((s.order_settings.fallbacks||[s.order_settings.fallback]).filter(Boolean).map(rule=>({...rule,close_conditions:rule.close_conditions||s.order_settings.close_conditions,stop_loss:rule.stop_loss||s.order_settings.stop_loss})));
+    document.getElementById('accuracyBuyGuardEnabled').checked=!!s.order_settings.accuracy_buy_guard?.enabled;
+    document.getElementById('accuracyBuyGuardMinInput').value=s.order_settings.accuracy_buy_guard?.min_accuracy_pct??60;
+    document.getElementById('accuracyBuyGuardHoursInput').value=s.order_settings.accuracy_buy_guard?.window_hours??24;
+    document.getElementById('choppinessBuyGuardEnabled').checked=!!s.order_settings.choppiness_buy_guard?.enabled;
+    document.getElementById('choppinessBuyGuardMaxInput').value=s.order_settings.choppiness_buy_guard?.max_score??3;
+    document.getElementById('choppinessBuyGuardRoundsInput').value=s.order_settings.choppiness_buy_guard?.rounds??3;
+    document.getElementById('choppinessBuyGuardSourceInput').value=s.order_settings.choppiness_buy_guard?.source??'bitcoin';
+    document.getElementById('choppinessCurrentEnabled').checked=!!s.order_settings.choppiness_buy_guard?.current_enabled;
+    document.getElementById('choppinessCurrentLimitInput').value=s.order_settings.choppiness_buy_guard?.current_limit??7;
+    document.getElementById('choppinessBlockNextInput').checked=!!s.order_settings.choppiness_buy_guard?.block_next_round;
     document.getElementById('allowMultiBuyInput').checked=s.order_settings.allow_multi_buy!==false;
     document.getElementById('timeInForceInput').value=s.order_settings.time_in_force||'ioc';
     const forceBuy=s.order_settings.force_buy||{enabled:false,minute_from:0,minute_to:15,min_distance_dollars:null,min_price_cents:0,max_price_cents:100,contracts:1,time_in_force:'ioc'};
@@ -2416,6 +2613,28 @@ async function requestForceBuy(){
   finally{forceBuyBusy=false;await poll();}
 }
 
+function renderChoppinessGuard(guard){
+  const status=document.getElementById('choppinessBuyGuardStatus');
+  if(!guard){status.textContent='';status.title='';return;}
+  const score=value=>Number.isFinite(value)?value.toFixed(2):'—';
+  const bitcoin=guard.source==='bitcoin';
+  const source=bitcoin?'Bitcoin':'Contract Yes';
+  const range=(item,average=false)=>{
+    const value=item?.[`${average?'average_range':'range'}_${bitcoin?'dollars':'cents'}`];
+    return Number.isFinite(value)?bitcoin?`$${score(value)}`:`${score(value)}¢`:'—';
+  };
+  const current=guard.current_round||{};
+  const count=current.observed_crossings??current.score;
+  const currentText=`Current crossings (partial): ${Number.isFinite(count)?count:'—'} · Range: ${range(current)}`;
+  const averageText=`Last ${guard.required_rounds} avg: ${score(guard.average_score)} · Avg range: ${range(guard,true)} (${guard.ready_rounds}/${guard.required_rounds} ready)`;
+  const until=guard.blocked_until?new Date(guard.blocked_until).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'round end';
+  const state=!guard.enabled?'Filter off':guard.current_blocked?`Buying paused until ${until}: current round ≥ ${guard.current_limit}`:guard.previous_blocked?`Buying paused until ${until}: previous round reached ${guard.previous_crossings}`:guard.allowed?'Buying allowed':!Number.isFinite(guard.average_score)?'Buying paused: insufficient data':'Buying paused: average crossings above limit';
+  const gates=`Average filter: ${guard.average_enabled?'on':'off'} · Current gate: ${guard.current_enabled?'on at ≥ '+guard.current_limit:'off'} · Following-round gate: ${guard.block_next_round?'on':'off'}`;
+  status.textContent=`${source} · ${currentText} · ${averageText} · ${gates} · ${state}`;
+  status.style.color=!guard.enabled?'':guard.allowed?'#62daa3':'#ff727d';
+  status.title=(guard.round_scores||[]).map(round=>`${source} · ${new Date(round.round_start).toLocaleString()}: ${score(round.score)} crossings · Range ${range(round)} · Samples ${round.sample_count??0}/${round.expected_samples??0}${round.missing_samples?' · gaps ignored':''}${round.status==='ready'?'':' · insufficient data'}`).join('\n');
+}
+
 function render(s){
   syncHeaderCountdown(s);
   forceBuyContext={asset:s.asset,round_start:s.round?.start};
@@ -2424,6 +2643,13 @@ function render(s){
   forceBuyButton.textContent=s.force_buy_pending?'Force Buy pending':'Force Buy';
   if(s.order_settings&&!balanceDirty&&document.activeElement?.id!=="initialBalanceInput") document.getElementById("initialBalanceInput").value=s.order_settings.initial_balance||0;
   syncOrderSettings(s);
+  renderChoppinessGuard(s.stats?.buy_choppiness_guard);
+  const accuracyGuard=s.stats?.buy_accuracy_guard;
+  const accuracyGuardStatus=document.getElementById('accuracyBuyGuardStatus');
+  if(accuracyGuard){
+    accuracyGuardStatus.textContent=`Last ${accuracyGuard.window_hours??24}h: ${accuracyGuard.total?accuracyGuard.accuracy.toFixed(2)+'% ('+accuracyGuard.hits+'/'+accuracyGuard.total+')':'No settled predictions'} · ${!accuracyGuard.enabled?'Filter off':accuracyGuard.allowed?'Buying allowed':'Automatic test mode · Real buys paused'}`;
+    accuracyGuardStatus.style.color=!accuracyGuard.enabled?'':accuracyGuard.allowed?'#62daa3':'#f5c76b';
+  }
   const balance=s.stats?.balance||{};
   const available=s.available_balance;
   document.getElementById("currentBalance").textContent=available?fmtMoney(available.amount):'—';
@@ -2438,6 +2664,9 @@ function render(s){
   document.getElementById("balanceDetail").textContent=`${balance.counted_purchases||0} settled purchases · ${balance.pending_or_missing||0} pending / missing data · all rounds · estimated fee 1.94¢ / CT on buy; 1.94¢ on filled sell; settlement: $1 winner / $0 loser, no sell fee`;
   const asset=s.asset||"BTC";
   document.getElementById("assetTitle").textContent=asset;
+  const stability=s.entry_stability;
+  document.getElementById('entryStabilityStatus').textContent=s.order_settings?.entry_stability?.enabled
+    ?`Observed: ${stability?.direction||'waiting for fresh BTC quotes'} · ${(stability?.seconds||0).toFixed(1)} / ${s.order_settings.entry_stability.seconds}s`:'';
   renderMarketCharts(s);
   document.getElementById("assetSelect").value=asset;
   const contractPrices=s.contract_prices;
@@ -2499,6 +2728,15 @@ function render(s){
       :"Enter the Robinhood target to generate the frozen prediction.";
   }
 
+  function appendRoundLearning(box,info){
+    if(!info)return;
+    const detail=document.createElement('div');
+    detail.className='muted';detail.style.fontSize='11px';detail.style.marginTop='8px';
+    const status=info.applied?'active':info.status==='shadow'?'evaluating':info.status==='training'?'training':'collecting data';
+    detail.textContent=`Round learning: ${status} · ${info.usable_rounds??0} settled rounds`;
+    if(info.candidate&&info.baseline)detail.textContent+=` · holdout accuracy ${(100*info.baseline.accuracy).toFixed(1)}% → ${(100*info.candidate.accuracy).toFixed(1)}%`;
+    box.append(detail);
+  }
   const p=s.prediction;
   const box=document.getElementById("decisionBox");
 
@@ -2514,6 +2752,7 @@ function render(s){
         <span class="red">BELOW ${p.p_down.toFixed(2)}%</span>
       </div>`;
 
+    appendRoundLearning(box,p.learning);
     document.getElementById("modelsBody").innerHTML=p.models.map(m=>{
       const c=m.probability_up>=55?"green":m.probability_up<=45?"red":"yellow";
       return `<tr>
@@ -2557,6 +2796,7 @@ function render(s){
         Minute ${String(rec.minute).padStart(2,"0")} · ${rec.remaining_minutes} min left<br>
         Since start: <span class="${clsSigned(rec.change_dollars)}">${fmtSigned(rec.change_dollars)} (${fmtSigned(rec.change_pct,4)}%)</span>
       </div>`;
+    appendRoundLearning(recBox,rec.learning);
     const support=rec.market_support;
     if(support){
       const detail=document.createElement('div');
@@ -2609,7 +2849,8 @@ function historyStatus(status){
 
 
 function settlementHistoryCell(row){
-  const direction=row.actual?historyDirection(row.actual):'<span class="round-empty">Not settled</span>';
+  if(!row.actual&&row.settlement==null) return '<span class="round-empty">—</span>';
+  const direction=row.actual?historyDirection(row.actual):'<span class="round-empty">—</span>';
   const source=row.settlement_source==='next_round_target'?'Settlement uses the next consecutive round target':'Recorded settlement price';
   const confirmed=row.settlement_source!=='next_round_target'&&row.result_confirmed_by==='user'?'<span class="round-prob" title="Outcome confirmed by user">User confirmed</span>':'';
   return `${direction}<span class="round-prob"><strong title="${source}">${fmtMoney(row.settlement)}</strong></span>${settlementDifferenceCell(row)}${confirmed}`;
@@ -2652,10 +2893,10 @@ function renderMarketCharts(s){
   const focused=sameRound&&document.activeElement===oldSvg;
   const observations=s.underlying_price_history||[],contractQuotes=s.contract_price_history||[];
   const tail=observations.at(-1),quoteTail=contractQuotes.at(-1);
-  const renderKey=JSON.stringify([chartKey,s.target,observations.length,tail?.observed_at,tail?.price,contractQuotes.length,quoteTail]);
+  const renderKey=JSON.stringify([chartKey,s.target,observations.length,tail?.observed_at,tail?.price,contractQuotes.length,quoteTail,s.live_recommendation_changes,s.chart_trades]);
   const chartChanged=chart.dataset.renderKey!==renderKey;
   if(chartChanged){
-    chart.innerHTML=underlyingPriceChart(observations,s.target,contractQuotes);
+    chart.innerHTML=underlyingPriceChart(observations,s.target,contractQuotes,s.live_recommendation_changes,s.chart_trades);
     chart.dataset.renderKey=renderKey;
   }
   chart.dataset.roundKey=chartKey;
@@ -2748,7 +2989,31 @@ function bitcoinDollarsPerCent60s(points,quotes){
   return results;
 }
 
-function underlyingPriceChart(samples,target,contractSamples=null){
+function chartTradeEvents(row){
+  if(!row)return [];
+  const start=Date.parse(row.round_start),events=[],seen=new Set();
+  for(const trade of [...(row.completed_purchases||[]),row.purchase].filter(Boolean)){
+    if(trade.status!=='filled')continue;
+    const settled=['UP / ABOVE','DOWN / BELOW'].includes(row.actual);
+    const settlementClose=settled&&trade.close_order?.status!=='filled'
+      ?{status:'filled',filled_at:row.round_end,execution_price_cents:trade.direction===row.actual?100:0,reason:'Settlement'}:null;
+    for(const [kind,order] of [['Buy',trade],['Close',settlementClose||trade.close_order]]){
+      if(!order||order.status!=='filled')continue;
+      const stamp=order.filled_at||order.submitted_at||order.attempted_at;
+      const minute=(Date.parse(stamp)-start)/60000;
+      if(!Number.isFinite(minute)||minute<0||minute>15)continue;
+      const key=JSON.stringify([kind,stamp,trade.attempted_at,trade.submitted_at,trade.direction]);
+      if(seen.has(key))continue;
+      seen.add(key);
+      events.push({kind,minute,stamp,direction:trade.direction,test:trade.test_mode===true,
+        price:order.execution_price_cents??order.limit_price_cents,
+        estimated:order.execution_price_cents==null,reason:order.reason});
+    }
+  }
+  return events.sort((a,b)=>a.minute-b.minute);
+}
+
+function underlyingPriceChart(samples,target,contractSamples=null,liveChanges=[],tradeRow=null){
   const points=(samples||[]).filter(p=>Number.isFinite(p.price)&&Number.isFinite(p.minute)&&p.minute>=0&&p.minute<15);
   const hasTarget=typeof target==='number'&&Number.isFinite(target);
   if(!points.length&&!hasTarget) return '<div class="muted" style="padding:12px 0">Waiting for fresh price observations and target…</div>';
@@ -2786,8 +3051,24 @@ function underlyingPriceChart(samples,target,contractSamples=null){
     }
     contractLines+=quotes.map(p=>`<circle class="merged-quote" cx="${x(p.minute)}" cy="${cy(p.yes_cents)}" r="0" data-minute="${p.minute}" data-yes="${p.yes_cents}" data-no="${p.no_cents}"/>`).join('');
   }
+  const changeMarkers=(liveChanges||[]).filter(change=>Number.isFinite(change.minute)&&change.minute>=0&&change.minute<15&&['UP / ABOVE','DOWN / BELOW'].includes(change.direction)).map(change=>{
+    const up=change.direction==='UP / ABOVE',color=up?'var(--green)':'var(--red)',px=x(change.minute);
+    const label=`Live recommendation: ${change.previous_direction} → ${change.direction} · ${new Date(change.observed_at).toLocaleTimeString()} · minute ${change.minute.toFixed(2)}`;
+    return `<g class="live-recommendation-change" tabindex="0" role="img" aria-label="${escapeHistory(label)}"><title>${escapeHistory(label)}</title><line x1="${px}" x2="${px}" y1="${t}" y2="${h-b}" stroke="${color}" stroke-dasharray="3 4" opacity=".65" vector-effect="non-scaling-stroke"/><circle cx="${px}" cy="${h-b-12}" r="10" fill="${color}"/><text x="${px}" y="${h-b-7}" text-anchor="middle" fill="#fff" font-size="16">${up?'↑':'↓'}</text></g>`;
+  }).join('');
+  const initialDirection=tradeRow?.prediction;
+  const hasInitialPrediction=['UP / ABOVE','DOWN / BELOW'].includes(initialDirection);
+  const initialUp=initialDirection==='UP / ABOVE',initialColor=initialUp?'var(--green)':'var(--red)';
+  const initialLabel=`Initial prediction · ${initialDirection} · round start${Number.isFinite(tradeRow?.p_up)?` · UP ${(tradeRow.p_up*100).toFixed(2)}%`:''}`;
+  const initialMarker=hasInitialPrediction?`<g class="initial-prediction-marker" tabindex="0" role="img" aria-label="${escapeHistory(initialLabel)}"><title>${escapeHistory(initialLabel)}</title><line x1="${x(0)}" x2="${x(0)}" y1="${t+82}" y2="${h-b}" stroke="${initialColor}" stroke-dasharray="5 4" vector-effect="non-scaling-stroke"/><rect x="${x(0)-12}" y="${t+62}" width="82" height="22" rx="4" fill="${initialColor}"/><text x="${x(0)+29}" y="${t+78}" text-anchor="middle" font-size="14" font-weight="bold" fill="#101820">P ${initialUp?'↑ UP':'↓ DOWN'}</text></g>`:'';
+  const tradeEvents=chartTradeEvents(tradeRow);
+  const tradeMarkers=tradeEvents.map(event=>{
+    const buy=event.kind==='Buy',color=buy?'var(--cyan)':'var(--yellow)',px=x(event.minute),py=buy?t+20:t+48;
+    const label=`${event.test?'TEST · ':''}${event.kind} · ${event.direction||''} · ${new Date(event.stamp).toLocaleTimeString()} · minute ${event.minute.toFixed(2)}${event.price!=null?` · ${event.reason==='Settlement'?'payout':event.estimated?'limit':'execution'} ${event.price}¢`:''}${event.reason?` · ${event.reason}`:''}`;
+    return `<g class="trade-chart-marker" data-kind="${event.kind}" tabindex="0" role="img" aria-label="${escapeHistory(label)}"><title>${escapeHistory(label)}</title><line x1="${px}" x2="${px}" y1="${py+10}" y2="${h-b}" stroke="${color}" stroke-dasharray="5 4" opacity=".7" vector-effect="non-scaling-stroke"/><rect x="${px-12}" y="${py-10}" width="24" height="20" rx="4" fill="${color}"/><text x="${px}" y="${py+5}" text-anchor="middle" font-size="15" font-weight="bold" fill="#101820">${buy?'B':'C'}</text></g>`;
+  }).join('');
   const last=points[points.length-1];
-  return `<div class="contract-chart"><svg data-unit="usd" viewBox="0 0 ${w} ${h}" role="img" tabindex="0" aria-label="Asset price and target over the full 15 minute round" onpointermove="if(this.querySelector('.contract-observation'))inspectContractChart(event,this)" onpointerleave="this.querySelector('.contract-cursor').setAttribute('visibility','hidden')" onkeydown="if(this.querySelector('.contract-observation'))inspectContractChartKey(event,this)"><g fill="var(--muted)" font-size="15">${axes}</g>${targetLine}${contractLines}<path class="underlying-price-line" d="${path}" fill="none" stroke="var(--blue)" stroke-width="1.5" vector-effect="non-scaling-stroke"/>${dots}${last?`<circle class="underlying-price-endpoint" cx="${x(last.minute)}" cy="${y(last.price)}" r="3.5" fill="var(--blue)"/>`:''}<g class="contract-cursor" visibility="hidden"><line y1="${t}" y2="${h-b}" stroke="var(--muted)" vector-effect="non-scaling-stroke"/><circle r="4.5" fill="var(--blue)" stroke="var(--panel)" stroke-width="2"/><text class="contract-cursor-time" y="22" fill="var(--muted)" font-size="18" text-anchor="middle"></text><g class="contract-cursor-price" font-size="18" text-anchor="middle"><text class="cursor-price-line" y="45"></text><text class="cursor-range-line" y="68"></text><text class="cursor-reversals-line" y="91"></text><text class="cursor-sensitivity-line" y="114"></text></g></g></svg>${volatilityHistoryChart(points)}</div>`;
+  return `<div class="contract-chart"><svg data-unit="usd" viewBox="0 0 ${w} ${h}" role="img" tabindex="0" aria-label="Asset price and target over the full 15 minute round" onpointermove="if(this.querySelector('.contract-observation'))inspectContractChart(event,this)" onpointerleave="this.querySelector('.contract-cursor').setAttribute('visibility','hidden')" onkeydown="if(this.querySelector('.contract-observation'))inspectContractChartKey(event,this)"><g fill="var(--muted)" font-size="15">${axes}</g>${targetLine}${contractLines}<path class="underlying-price-line" d="${path}" fill="none" stroke="var(--blue)" stroke-width="1.5" vector-effect="non-scaling-stroke"/>${dots}${changeMarkers}${initialMarker}${tradeMarkers}${last?`<circle class="underlying-price-endpoint" cx="${x(last.minute)}" cy="${y(last.price)}" r="3.5" fill="var(--blue)"/>`:''}<g class="contract-cursor" visibility="hidden"><line y1="${t}" y2="${h-b}" stroke="var(--muted)" vector-effect="non-scaling-stroke"/><circle r="4.5" fill="var(--blue)" stroke="var(--panel)" stroke-width="2"/><text class="contract-cursor-time" y="22" fill="var(--muted)" font-size="18" text-anchor="middle"></text><g class="contract-cursor-price" font-size="18" text-anchor="middle"><text class="cursor-price-line" y="45"></text><text class="cursor-range-line" y="68"></text><text class="cursor-reversals-line" y="91"></text><text class="cursor-sensitivity-line" y="114"></text></g></g></svg>${(liveChanges||[]).length?'<div class="muted">Live recommendation changes: <span style="color:var(--green)">↑ UP</span> · <span style="color:var(--red)">↓ DOWN</span> · Hover over a marker for time</div>':''}${hasInitialPrediction?'<div class="muted">P · Initial prediction at round start</div>':''}${tradeEvents.length?'<div class="muted">Trades: <span style="color:var(--cyan)">B · Buy</span> · <span style="color:var(--yellow)">C · Close</span> · Hover for time and contract price · TEST = virtual trade</div>':''}${volatilityHistoryChart(points)}</div>`;
 }
 
 function showContractChartPoint(svg,index){
@@ -2878,14 +3159,20 @@ function roundTimingCell(row,isCurrent=false){
   const percent=row.last_live_change_pct_at_change;
   const sinceStart=row.last_live_change_at?`<span class="round-prob" title="Since-start change captured at the last live direction switch">Since start: ${typeof dollars==='number'&&Number.isFinite(dollars)?fmtSigned(dollars):'—'} (${typeof percent==='number'&&Number.isFinite(percent)?fmtSigned(percent,4)+'%':'—'})</span>`:'';
   const hasChart=row.contract_price_history?.length||row.underlying_price_history?.length;
-  const quotes=!isCurrent&&hasChart?`<button type="button" class="round-chart-button">Round chart</button><template class="round-chart-template"><div class="muted">${escapeHistory(row.asset||'BTC')} · ${escapeHistory(new Date(row.round_start).toLocaleString())} · Target ${fmtMoney(row.target)}</div><div class="muted"><span style="color:var(--blue)">● Bitcoin Δ</span> · <span style="color:var(--green)">● Yes</span></div>${!row.underlying_price_history?.length?'<div class="muted">No saved Bitcoin observations for this round</div>':''}${underlyingPriceChart(row.underlying_price_history,row.target,row.contract_price_history||[])}</template>`:'';
+  const chop=row.choppiness;
+  const scoreReady=chop?.status==='ready'&&Number.isFinite(chop.score);
+  const scoreSource=chop?.source==='bitcoin'?'BTC':'Yes';
+  const scoreRange=chop?.source==='bitcoin'?fmtMoney(chop.range_dollars):`${minute(chop?.range_cents)}¢`;
+  const scoreTitle=scoreReady?`Midpoint crossings: ${scoreSource} crossing ${scoreSource==='BTC'?fmtMoney(chop.midpoint):'50¢'} in 15-second samples. First observed side and exact touches do not count. Range: ${scoreRange}. Samples: ${chop.sample_count}/${chop.expected_samples}.${chop.missing_samples?' Gaps ignored.':''}`:`Midpoint crossings unavailable: insufficient saved ${scoreSource} observations or missing round target.`;
+  const roundScore=`<span class="round-prob round-choppiness-score" style="color:var(--${scoreReady?'blue':'muted'})" title="${scoreTitle}">Score (${scoreSource}): ${scoreReady?chop.score:'—'}</span>`;
+  const quotes=!isCurrent&&hasChart?`<button type="button" class="round-chart-button">Round chart</button>${roundScore}<template class="round-chart-template"><div class="muted">${escapeHistory(row.asset||'BTC')} · ${escapeHistory(new Date(row.round_start).toLocaleString())} · Target ${fmtMoney(row.target)}</div><div class="muted"><span style="color:var(--blue)">● Bitcoin Δ</span> · <span style="color:var(--green)">● Yes</span></div>${!row.underlying_price_history?.length?'<div class="muted">No saved Bitcoin observations for this round</div>':''}${underlyingPriceChart(row.underlying_price_history,row.target,row.contract_price_history||[],row.live_recommendation_changes,row)}</template>`:'';
   return `<span class="round-prob" title="Last live direction change: ${stamp(row.last_live_change_at)}"><span class="round-status muted" title="${escapeHistory(historyStatus(row.status))}" aria-label="${escapeHistory(historyStatus(row.status))}">${row.status==='predicted'?'🔮':row.status==='settled'?'🏁':escapeHistory(historyStatus(row.status))}</span> Live change${liveArrow}: ${minute(row.last_live_change_minute)}</span>`+sinceStart+priceEvent+quotes;
 }
 
 function purchaseLiveCell(row){
   const visiblePurchase=row.purchase||row.completed_purchases?.[row.completed_purchases.length-1];
   const live=visiblePurchase?.live_recommendation;
-  if(!live) return '<span class="round-empty">Not recorded</span>';
+  if(!live) return '<span class="round-empty">—</span>';
   const hit=row.actual?live.direction===row.actual:null;
   const stamp=live.updated_at?new Date(live.updated_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}):null;
   return historyDecision(live.direction,live.p_up,hit)+(stamp?`<span class="round-prob">${escapeHistory(stamp)}</span>`:'');
@@ -2897,11 +3184,12 @@ function purchaseConditionsCell(purchase){
   const sources={final:'Final Prediction',live:'Current Prediction',either:'Final or Current Prediction',both:'Final and Current Prediction'};
   const models=Array.isArray(c.required_models)&&c.required_models.length?c.required_models.join(', '):'None';
   const rule=c.rule==='force_buy'?`<div>Force Buy · BRTI distance: ${c.force_buy?.min_distance_dollars==null?'Off':`&gt; $${escapeHistory(c.force_buy.min_distance_dollars)}`}</div>`:c.rule==='fallback'?`<div>Fallback ${escapeHistory(c.fallback_rule_number||1)} · ${c.fallback?.min_distance_dollars===null?'BRTI distance: Off':`BRTI distance &gt; $${escapeHistory(c.fallback?.min_distance_dollars)}`}</div>`:'';
-  const strength=c.min_live_strength?`<div>Live strength ≥ ${escapeHistory(c.min_live_strength)}</div>`:'';
+  const stability=c.entry_stability?.enabled?`<div>BTC on buy side of target ≥ ${escapeHistory(c.entry_stability.seconds)} seconds</div>`:'';
+  const strength=c.min_live_strength?`<div>Strength ≥ ${escapeHistory(c.min_live_strength)}</div>`:'';
   const trend=c.contract_trend_changes?`<div>Contract price: upward overall trend over ${escapeHistory(c.contract_trend_changes)} changes</div>`:c.contract_upward_changes?`<div>Contract price: ${escapeHistory(c.contract_upward_changes)} consecutive upward changes</div>`:'';
-  return `<details class="order-conditions"><summary>Buy conditions</summary><div class="purchase-detail-fields">${rule}${trend}${strength}<div>Price &gt; ${escapeHistory(c.min_price_cents)}¢ and &lt; ${escapeHistory(c.max_price_cents)}¢</div><div>Purchase minutes: ${c.purchase_minute_from==null?"Not recorded":`${escapeHistory(c.purchase_minute_from)}–${escapeHistory(c.purchase_minute_to)} after round start`}</div><div>Agree with: ${escapeHistory(sources[c.agreement_basis]||c.agreement_basis)}</div><div>Models: ${escapeHistory(models)}</div><div>CTs: ${escapeHistory(c.contracts)}</div></div></details>`;
+  return `<details class="order-conditions"><summary>Buy conditions</summary><div class="purchase-detail-fields">${rule}${trend}${strength}${stability}<div>Price &gt; ${escapeHistory(c.min_price_cents)}¢ and &lt; ${escapeHistory(c.max_price_cents)}¢</div><div>Purchase minutes: ${c.purchase_minute_from==null?"Not recorded":`${escapeHistory(c.purchase_minute_from)}–${escapeHistory(c.purchase_minute_to)} after round start`}</div><div>Agree with: ${escapeHistory(sources[c.agreement_basis]||c.agreement_basis)}</div><div>Models: ${escapeHistory(models)}</div><div>CTs: ${escapeHistory(c.contracts)}</div></div></details>`;
 }
-function purchaseMinuteCell(row){
+function purchaseMinuteCell(row,plain=false){
   const purchase=row.purchase;
   if(!purchase) return '';
   let value=purchase.purchase_minute;
@@ -2910,7 +3198,7 @@ function purchaseMinuteCell(row){
     value=timestamp?(Date.parse(timestamp)-Date.parse(row.round_start))/60000:NaN;
   }
   const label=Number.isFinite(value)&&value>=0&&value<=15?value.toFixed(2):'—';
-  return `<span class="round-prob" title="Purchase minute after round start">Executed: ${label}</span>`;
+  return plain?label:`<span class="round-prob" title="Purchase minute after round start">${label}</span>`;
 }
 function purchaseHistoryCell(row,archived=false){
   const purchase=row.purchase;
@@ -2926,7 +3214,8 @@ function purchaseHistoryCell(row,archived=false){
   if(purchase&&purchase.status==='filled'){
     return '<span class="round-tag green">Filled</span>'+remove;
   }
-  return `<span class="round-tag muted">${purchase?(purchase.status==='cancelled'?'Cancelled in app':purchase.status==='attempted'?'Attempted · unconfirmed':'Unconfirmed'):row.purchase_removed?'Removed':'Not recorded'}</span>${remove}<br><button class="secondary confirm-filled" data-asset="${escapeHistory(row.asset)}" data-round="${escapeHistory(row.round_start)}">Mark filled</button>`;
+  const status=purchase?(purchase.status==='cancelled'?'Cancelled in app':purchase.status==='attempted'?'Attempted · unconfirmed':'Unconfirmed'):row.purchase_removed?'Removed':'';
+  return `${status?`<span class="round-tag muted">${status}</span>${remove}<br>`:''}<button class="secondary confirm-filled" data-asset="${escapeHistory(row.asset)}" data-round="${escapeHistory(row.round_start)}">Mark filled</button>`;
 }
 function purchaseProfitCell(row){
   const closed=row.visible_purchase_pnl;
@@ -2934,16 +3223,18 @@ function purchaseProfitCell(row){
   const value=typeof closed==='number'?closed:open?.net_pnl;
   if(typeof closed!=='number'&&!open) return '';
   const color=value==null?'muted':value>0?'green':value<0?'red':'muted';
-  const title=typeof closed==='number'?'Net P/L after close or settlement; includes buy/sell fees; recorded execution prices used when available, otherwise estimated from limits':'Unrealized net P/L if sold at the fresh held-side bid; includes buy fee and estimated sell fee';
-  return `<span class="round-tag ${color}" style="margin:0;padding:0 6px;font-size:11px;line-height:12px" title="${title}">${value==null?'—':`$${fmtSigned(value,4)}`}</span>`;
+  const virtual=row.purchase?.test_mode===true;
+  const title=virtual?(typeof closed==='number'?'Virtual net P/L after simulated close or settlement; includes estimated fees':'Virtual unrealized net P/L at the fresh displayed contract quote; includes estimated buy and sell fees'):(typeof closed==='number'?'Net P/L after close or settlement; includes buy/sell fees; recorded execution prices used when available, otherwise estimated from limits':'Unrealized net P/L if sold at the fresh held-side bid; includes buy fee and estimated sell fee');
+  const label=virtual?'V ':'';
+  return `<span class="round-tag ${color}" style="margin:0;padding:0 6px;font-size:11px;line-height:12px" title="${title}">${label}${value==null?'—':`$${fmtSigned(value,4)}`}</span>`;
 }
 
-function purchaseDirectionLabel(direction,timestamp=null){
+function purchaseDirectionLabel(direction,minute=null){
   const up=direction==='UP / ABOVE',down=direction==='DOWN / BELOW';
   const color=up?'var(--green)':down?'var(--red)':'var(--muted)';
   const arrow=up?'↑ ':down?'↓ ':'';
   const label=up?'UP':down?'DOWN':'Not recorded';
-  return `<span class="round-prob purchase-direction" style="color:${color};white-space:nowrap;font-weight:600">${arrow}Buy: ${label}${timestamp?` <span style="color:var(--text);font-weight:400">· ${tradeTime(timestamp)}</span>`:''}</span>`;
+  return `<span class="round-prob purchase-direction" style="color:${color};white-space:nowrap;font-weight:600">${arrow}Buy: ${label}${minute!==null?` <span title="Purchase minute after round start" style="color:var(--text);font-weight:400">· ${minute}</span>`:''}</span>`;
 }
 
 function manualCloseButton(row,archived){
@@ -2997,28 +3288,31 @@ function closingBtcDifference(row,purchase){
 function purchaseExecutionDetails(row,archived=false){
   const purchase=row.purchase;
   if(!purchase) return '';
-  const edit=archived?'':` <button class="secondary edit-purchase-price" aria-label="Edit CT price" title="Edit recorded CT price in cents" data-asset="${escapeHistory(row.asset)}" data-round="${escapeHistory(row.round_start)}" data-price="${escapeHistory(purchase.limit_price_cents??'')}">✎</button>`;
+  const edit=archived?'':` <button class="secondary edit-purchase-price" aria-label="Edit CT price" title="Edit recorded CT price in cents" data-asset="${escapeHistory(row.asset)}" data-round="${escapeHistory(row.round_start)}" data-price="${escapeHistory(purchase.execution_price_cents??purchase.limit_price_cents??'')}">✎</button>`;
   const closing=purchase.close_order;
   const closeStatus=closing?.status==='filled'||closing?.status==='submitted'?'Closed':'Close unconfirmed';
   const closeReasons={stop_loss:'Stop loss',close_conditions:'Early Profit',force_close:'Force Close',force_stop:'Force Close'};
   const closeReason=closeReasons[closing?.reason]?` : ${closeReasons[closing.reason]}`:'';
-  const closeInfo=closing?`<span>${closeStatus}${closeReason} · ${tradeTime(closing.filled_at||closing.submitted_at||closing.attempted_at)}</span><span>limit: ${escapeHistory(closing.limit_price_cents??'—')}¢</span>${closing.execution_price_cents!=null?`<span>Close price: ${escapeHistory(closing.execution_price_cents)}¢</span>`:''}`:row.status==='settled'?`<span>Closed : Settlement · ${tradeTime(row.round_end)}</span>`:'';
+  const closeInfo=closing?`<span>${closeStatus}${closeReason} · ${tradeMinute(closing.filled_at||closing.submitted_at||closing.attempted_at,row.round_start)}</span><span>limit: ${escapeHistory(closing.limit_price_cents??'—')}¢</span>${closing.execution_price_cents!=null?`<span>Close price: ${escapeHistory(closing.execution_price_cents)}¢</span>`:''}`:row.status==='settled'?`<span>Closed : Settlement · ${tradeMinute(row.round_end,row.round_start)}</span>`:'';
   const closeDelta=closingBtcDifference(row,purchase);
   const closeBtcDiff=closing||row.status==='settled'?`<span title="BTC price minus target at close submission, or settlement price minus target">Close BTC Δ: ${Number.isFinite(closeDelta)?`${closeDelta>=0?'+':'−'}${fmtMoney(Math.abs(closeDelta))}`:'—'}</span>`:'';
   const canForce=!archived&&row.is_current&&purchase.status==='filled'&&!closing;
   const closeOverrides=canForce?['ignore_early_profit','ignore_stop_loss'].map((field,index)=>`<label class="trade-close-toggle" onclick="event.stopPropagation()"><input type="checkbox" class="trade-close-override" data-field="${field}" data-asset="${escapeHistory(row.asset)}" data-round="${escapeHistory(row.round_start)}" data-token="${escapeHistory(purchase.attempted_at||purchase.submitted_at||'')}" ${purchase[field]?'checked':''}>Ignore ${index===0?'Early Profit':'Stop Loss'}</label>`).join(''):'';
   const forceButton=canForce?`<button type="button" class="secondary force-close" data-asset="${escapeHistory(row.asset)}" data-round="${escapeHistory(row.round_start)}" data-token="${escapeHistory(purchase.attempted_at||purchase.submitted_at||'')}" ${purchase.force_close_token||!row.force_close_enabled?'disabled':''} title="Enable Force Close and press to request a close under its independent conditions">${purchase.force_close_token?'Force Close pending':'Force Close'}</button>`:'';
   const price=purchase.execution_price_cents??purchase.limit_price_cents;
-  const limit=purchase.execution_price_cents!=null&&purchase.execution_price_cents!==purchase.limit_price_cents?`<span>Limit: ${escapeHistory(purchase.limit_price_cents??'—')}¢</span>`:'';
   const delta=purchase.btc_target_diff_dollars;
-  const btcDiff=`<span title="BTC price minus target at buy submission">BTC Δ: ${Number.isFinite(delta)?`${delta>=0?'+':'−'}${fmtMoney(Math.abs(delta))}`:'—'}</span>`;
-  return `<div class="purchase-detail-fields closed-trade-execution">${purchaseDirectionLabel(purchase.direction,purchase.submitted_at||purchase.filled_at||purchase.attempted_at)}${purchaseMinuteCell(row)}${btcDiff}<span>CTs: ${escapeHistory(purchase.contracts??'—')}</span><span>price: ${escapeHistory(price??'—')}¢${edit}</span>${limit}${closeInfo}${closeBtcDiff}${manualCloseButton(row,archived)}${closeOverrides}${forceButton}${purchaseProfitCell(row)}</div>`;
+  const btcDiff=`<span title="BTC price minus target at buy submission">Open BTC Δ: ${Number.isFinite(delta)?`${delta>=0?'+':'−'}${fmtMoney(Math.abs(delta))}`:'—'}</span>`;
+  return `<div class="purchase-detail-fields closed-trade-execution"><span>${purchase.test_mode?"V · ":""}CTs: ${escapeHistory(purchase.contracts??'—')}</span>${purchaseDirectionLabel(purchase.direction,purchaseMinuteCell(row,true))}<span>price: ${escapeHistory(price??'—')}¢${edit}</span>${btcDiff}${closeInfo}${closeBtcDiff}${manualCloseButton(row,archived)}${closeOverrides}${forceButton}</div>`;
+}
+function tradeMinute(value,start){
+  const minute=(Date.parse(value)-Date.parse(start))/60000;
+  return Number.isFinite(minute)&&minute>=0?minute.toFixed(2):'—';
 }
 function tradeTime(value){
   return value&&Number.isFinite(Date.parse(value))?escapeHistory(new Date(value).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})):'—';
 }
 function closedTradeTimes(purchase,row={}){
-  return `<span>· ${tradeTime(purchase.submitted_at||purchase.filled_at||purchase.attempted_at)}</span>${purchaseMinuteCell({...row,purchase})}`;
+  return `<span>${purchase.test_mode?"TEST · virtual · ":""}· ${tradeTime(purchase.submitted_at||purchase.filled_at||purchase.attempted_at)}</span>${purchaseMinuteCell({...row,purchase})}`;
 }
 
 function purchaseDetailsRows(row,key,signature){
@@ -3034,7 +3328,7 @@ function purchaseDetailsRows(row,key,signature){
       executionRow.open_purchase_pnl=null;
     }
     const conditions=purchaseConditionsCell(trade.purchase).replace(/^<details[^>]*><summary>.*?<\/summary>/,'').replace(/<\/details>$/,'');
-    return `<details class="closed-trade-fields"><summary class="trade-line"><span class="closed-trade-heading">T${trade.number}</span><span class="trade-conditions-toggle">Buy conditions</span>${purchaseExecutionDetails(executionRow,trade.archived)}</summary><div class="trade-conditions-content">${conditions}</div></details>`;
+    return `<details class="closed-trade-fields"><summary class="trade-line"><span class="closed-trade-heading">T${trade.number}</span>${purchaseProfitCell(executionRow)}<span class="trade-conditions-toggle">Buy conditions</span>${purchaseExecutionDetails(executionRow,trade.archived)}</summary><div class="trade-conditions-content">${conditions}</div></details>`;
   }).join('');
   return [{key:`${key}:trades`,signature,html:`<td colspan="10"><div class="round-purchase-details">${html}</div></td>`}];
 }
@@ -3204,7 +3498,7 @@ async function poll(){
   }finally{statePollBusy=false;}
 }
 
-setInterval(poll,1000);
+setInterval(poll,500);
 poll();
 </script>
 </body>

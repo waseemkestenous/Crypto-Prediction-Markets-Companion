@@ -4,7 +4,8 @@
   "**/.venv": true,
   "**/.vscode": true,
   "**/.git": true,
-  "**/__pycache__": true
+  "**/__pycache__": true,
+  "**/*.tmp": true
 },
   "files.watcherExclude": {
     "**/.robinhood-browser/**": true

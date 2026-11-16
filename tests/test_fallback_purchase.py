@@ -5,9 +5,9 @@ import order_settings as settings
 import robinhood_target as rh
 
 class FallbackTests(unittest.TestCase):
-    def form(self,direction='UP / ABOVE',brti=83100,price=80,minute=14,purchased=False,min_distance=50):
+    def form(self,direction='UP / ABOVE',brti=83100,price=80,minute=14,purchased=False,min_distance=50, changes=10, strength="MODERATE", confidence=.7):
         now=datetime.now().astimezone();start=now-timedelta(minutes=minute);end=start+timedelta(minutes=15)
-        p={'direction':'UP / ABOVE','target':83000,'live_direction':direction,'live_snapshot':{'direction':direction,'confidence':.7},'brti_price':brti,'purchase_exists':purchased,'order_settings':dict(settings.DEFAULTS,fallback=dict(settings.FALLBACK_DEFAULTS,enabled=True,contracts=3,min_distance_dollars=min_distance))}
+        p={'direction':'UP / ABOVE','target':83000,'live_direction':direction,'live_snapshot':{'direction':direction,'confidence':confidence},'brti_price':brti,'purchase_exists':purchased,'order_settings':dict(settings.DEFAULTS,fallback=dict(settings.FALLBACK_DEFAULTS,enabled=True,contracts=3,min_distance_dollars=min_distance,contract_trend_changes=changes,min_live_strength=strength))}
         key='yes_cents' if direction=='UP / ABOVE' else 'no_cents'
         other='no_cents' if key=='yes_cents' else 'yes_cents'
         p['contract_price_history']=[{'target':83000,'observed_at':(start+timedelta(seconds=i)).isoformat(),key:round(price-.1+i*.01,4),other:round(101-price+.1-i*.01,4)} for i in range(11)]
@@ -22,6 +22,28 @@ class FallbackTests(unittest.TestCase):
         with patch.object(rh,'read_event_target',return_value=83000), patch.object(rh,'review_buy_details',return_value=True), patch.object(rh,'select_time_in_force'), patch.object(rh,'parse_contract_prices',return_value=p['contract_prices']):
             result=rh.prepare_contract_form(page,'BTC',start,end,lambda *args:p,Mock(),record,fallback=True)
         return result,page,record
+
+    def test_independent_changes_and_strength_are_enforced_and_recorded(self):
+        for changes, strength, allowed in ((2, 'WEAK', True), (11, 'WEAK', False), (2, 'STRONG', False)):
+            with self.subTest(changes=changes, strength=strength):
+                result, _, record = self.form(changes=changes, strength=strength, confidence=.57)
+                self.assertEqual(result, allowed)
+                if allowed:
+                    conditions = record.call_args_list[0].args[3]['conditions']
+                    self.assertEqual(conditions['contract_trend_changes'], changes)
+                    self.assertEqual(conditions['min_live_strength'], strength)
+                else:
+                    record.assert_not_called()
+
+    def test_fallback_filter_migration_and_validation(self):
+        migrated = settings.validate(dict(settings.DEFAULTS, contract_trend_changes=4, min_live_strength='WEAK'))
+        self.assertEqual(migrated['fallbacks'][0]['contract_trend_changes'], 4)
+        self.assertEqual(migrated['fallbacks'][0]['min_live_strength'], 'WEAK')
+        for value in (0, 1.5, True, None, float('inf')):
+            with self.assertRaises(ValueError):
+                settings.validate(dict(settings.DEFAULTS, fallbacks=[{'contract_trend_changes':value}]))
+        with self.assertRaises(ValueError):
+            settings.validate(dict(settings.DEFAULTS, fallbacks=[{'min_live_strength':'unknown'}]))
 
     def test_up_down_use_current_prediction_and_fallback_quantity(self):
         for direction,brti in (('UP / ABOVE',83100),('DOWN / BELOW',82900)):
@@ -145,7 +167,7 @@ class FallbackTests(unittest.TestCase):
         first = dict(settings.FALLBACK_DEFAULTS, enabled=True, contracts=2)
         second = dict(first, minute_from=10, min_distance_dollars=100, contracts=5)
         self.assertEqual(settings.validate(dict(settings.DEFAULTS, fallback=first))['fallbacks'],
-                         [dict(first, close_conditions=settings.CLOSE_DEFAULTS, stop_loss=settings.STOP_LOSS_DEFAULTS)])
+                         [dict(first, contract_trend_changes=10, min_live_strength="MODERATE", close_conditions=settings.CLOSE_DEFAULTS, stop_loss=settings.STOP_LOSS_DEFAULTS)])
         result = settings.validate(dict(settings.DEFAULTS, fallbacks=[first, second]))
         self.assertEqual([r['contracts'] for r in result['fallbacks']], [2, 5])
         self.assertEqual(settings.validate(dict(settings.DEFAULTS, fallbacks=[]))['fallbacks'], [])

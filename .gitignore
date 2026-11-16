@@ -2,6 +2,7 @@ __pycache__
 .venv
 data.json
 .robinhood-browser/
+.crypto-com-browser/
 current_target.json
 current_target.tmp
 next_target.json

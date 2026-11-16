@@ -1,5 +1,6 @@
 """Conservative live calibration from past observed rounds, gated by holdout scores."""
 import math
+import json
 from datetime import datetime, timedelta
 import numpy as np
 import price_history
@@ -71,6 +72,30 @@ def scores(examples, probabilities):
     return {'rounds':len(grouped),'samples':len(examples),'brier':float(result[0]),'log_loss':float(result[1]),'accuracy':float(result[2])}
 
 
+def recorded_baselines(asset, start, end, target):
+    """Recover pre-learning Live probabilities actually available during the round."""
+    path = price_history.path_for(asset, start).with_suffix('.live.jsonl')
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    records = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                continue
+            stamp = datetime.fromisoformat(row['updated_at'])
+            base = (row.get('learning') or {}).get('base_p_up', row.get('p_up'))
+            if (start <= stamp < end and finite(base) and 0 <= base <= 1
+                    and finite(row.get('current_price')) and finite(row.get('target_gap'))
+                    and abs(row['current_price']-row['target_gap']-target) < .001):
+                records.append((stamp, base))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sorted(records)
+
+
 class LiveLearner:
     def __init__(self):
         self.key=None
@@ -80,6 +105,7 @@ class LiveLearner:
     def train(self, asset, start, rows, baseline):
         self.model=None
         usable=[];excluded=0
+        recorded_samples=replayed_samples=0
         candidates=[]
         for row in rows:
             try:
@@ -103,6 +129,7 @@ class LiveLearner:
                 # Reject labels incompatible with the recorded settlement-minute prices.
                 if len(tail)<4 or settlement<min(tail)-2 or settlement>max(tail)+2 or (settlement>=target)!=(row['actual']=='UP / ABOVE'):
                     excluded+=1;continue
+                recorded = recorded_baselines(asset, first, last, target)
                 samples=[]
                 for minute in (2,5,8,11,14):
                     point=next((p for p in points if minute<=p['minute']<minute+.25),None)
@@ -110,7 +137,13 @@ class LiveLearner:
                     stamp=datetime.fromisoformat(point['observed_at'])
                     info={'start':first,'end':last,'target':target,'p_up':prior,
                           'start_reference':points[0]['price'],'prediction':row['prediction']}
-                    base=baseline(info,point['price'],stamp)
+                    available = [(when, value) for when, value in recorded if 0 <= (stamp-when).total_seconds() <= 20]
+                    if available:
+                        base = available[-1][1]
+                        recorded_samples += 1
+                    else:
+                        base = baseline(info,point['price'],stamp)
+                        replayed_samples += 1
                     output=features(points,target,stamp,first,last,base)
                     if output:
                         samples.append({'round':first.isoformat(),'x':output[0],'y':int(row['actual']=='UP / ABOVE'),'base':base})
@@ -119,7 +152,8 @@ class LiveLearner:
             except (KeyError,ValueError,TypeError,OverflowError):
                 excluded+=1
         self.info={'status':'insufficient','usable_rounds':len(usable),'excluded_rounds':excluded,
-                   'minimum_rounds':MIN_ROUNDS,'features':list(FEATURES),'blend':BLEND}
+                   'minimum_rounds':MIN_ROUNDS,'features':list(FEATURES),'blend':BLEND,
+                   'recorded_samples':recorded_samples,'replayed_samples':replayed_samples}
         if len(usable)<MIN_ROUNDS:return
         cut=int(len(usable)*.7)
         train=[e for group in usable[:cut] for e in group];holdout=[e for group in usable[cut:] for e in group]

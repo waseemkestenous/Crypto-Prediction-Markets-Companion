@@ -1,0 +1,29 @@
+{
+  "status": "shadow",
+  "applied": false,
+  "usable_rounds": 268,
+  "excluded_rounds": 1,
+  "minimum_rounds": 40,
+  "base_p_up": 0.6179240912778544,
+  "blend": 0.25,
+  "baseline": {
+    "rounds": 81,
+    "samples": 81,
+    "brier": 0.25004196247139016,
+    "log_loss": 0.6933048672331964,
+    "accuracy": 0.5679012345679012
+  },
+  "candidate": {
+    "rounds": 81,
+    "samples": 81,
+    "brier": 0.25274455861688533,
+    "log_loss": 0.6987285369651048,
+    "accuracy": 0.5802469135802469
+  },
+  "candidate_p_up": 0.6056319751575608,
+  "training_rounds": 187,
+  "validation_rounds": 81,
+  "training_end": "2026-10-17T00:00:00-05:00",
+  "validation_start": "2026-10-17T00:15:00-05:00",
+  "evaluation_note": "Chronological holdout of recorded frozen probabilities; illustrative current candidate uses the latest recorded feature vector. No historical decisions changed."
+}

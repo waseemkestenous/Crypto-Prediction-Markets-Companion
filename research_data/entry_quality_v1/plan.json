@@ -1,0 +1,10 @@
+{
+  "study": "entry_quality_v1",
+  "started_local": "2026-11-06T00:49:09-06:00",
+  "timezone": "America/Chicago",
+  "first_review_not_before": "2026-11-09T01:00:00-06:00",
+  "minimum_completed_rounds": 250,
+  "minimum_resolved_filled_trades": 50,
+  "factors": ["crossings_before_entry_and_last_120s", "observed_same_side_duration", "target_distance_relative_to_120s_range", "time_remaining", "contract_direction_and_quote_age", "model_agreement"],
+  "policy": "Observation only; preserve trading settings. Review after both elapsed time and sample minimums. Use chronological evaluation, then prospective confirmation of fixed rules before activation. Reconstruct executed entry features from snapshots at or before attempted_at, never after. No-buy snapshots are not automatically eligible opportunities. Missing coverage must be reported, not treated as stability. Existing guards censor opportunities and must be included in analysis. No automatic review or settings change is scheduled."
+}

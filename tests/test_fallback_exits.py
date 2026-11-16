@@ -44,7 +44,7 @@ class FallbackExitTests(unittest.TestCase):
                       if 'function readFallbackRules' in script)
         helpers = source[source.index('let orderSettingsDirty='):source.index('async function saveOrderSettings')]
         rules = settings.validate(dict(settings.DEFAULTS, fallbacks=[
-            {'stop_loss': {'drop_cents': 5}}, {'stop_loss': {'drop_cents': 12}}]))['fallbacks']
+            {'contract_trend_changes':3, 'min_live_strength':'WEAK', 'stop_loss': {'drop_cents': 5}}, {'contract_trend_changes':7, 'min_live_strength':'STRONG', 'stop_loss': {'drop_cents': 12}}]))['fallbacks']
         with sync_playwright() as pw:
             browser = pw.chromium.launch(channel='chrome', headless=True)
             page = browser.new_page()
@@ -55,6 +55,8 @@ class FallbackExitTests(unittest.TestCase):
             self.assertEqual(page.locator('#closeEnabled, #stopLossEnabled').count(), 0)
             self.assertEqual(page.locator('#fallbackRules [data-exit=close_conditions][data-key=enabled]').count(), 2)
             self.assertEqual(page.locator('#fallbackRules [data-exit=stop_loss][data-key=enabled]').count(), 2)
+            self.assertEqual(page.locator('#fallbackRules [data-field=contract_trend_changes]').count(), 2)
+            self.assertEqual(page.locator('#fallbackRules [data-field=min_live_strength]').count(), 2)
             page.evaluate('moveFallbackRule(0,1)')
             actual = page.evaluate('readFallbackRules()')
             self.assertEqual([rule['stop_loss']['drop_cents'] for rule in actual], [12, 5])

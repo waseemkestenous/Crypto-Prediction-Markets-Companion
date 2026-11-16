@@ -49,6 +49,37 @@ class RuntimePerformanceTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text())[0]['target'],83000)
         self.assertEqual(list(self.root.glob('*.tmp')),[])
 
+    def test_live_update_does_not_serialize_archived_rounds_again(self):
+        older = (self.start-timedelta(minutes=15)).isoformat()
+        journal.upsert('BTC',older,self.start.isoformat(),target=82000,
+                       contract_price_history=[{'yes_cents': 40}]*1000)
+        self.save(target=83000,purchase={'conditions':{'contracts':2}})
+        dumps = json.dumps
+        def encode(value, **kwargs):
+            if isinstance(value,dict) and value.get('round_start') == older:
+                raise AssertionError('Archived round was serialized again')
+            return dumps(value,**kwargs)
+        with patch.object(journal.json,'dumps',side_effect=encode):
+            self.save(target=83001)
+        saved=json.loads(journal.path_for('BTC').read_text())
+        self.assertEqual(len(saved),2)
+        self.assertEqual(saved[0]['contract_price_history'],[{'yes_cents':40}]*1000)
+        row=journal.get('BTC',self.start.isoformat(),include_quotes=False)
+        row['purchase']['conditions']['contracts']=99
+        self.assertEqual(journal.get('BTC',self.start.isoformat())['purchase']['conditions']['contracts'],2)
+
+    def test_display_aggregates_are_reused_briefly_and_settings_invalidate(self):
+        with patch.dict(app._DASHBOARD_STATS_CACHE,clear=True),patch.object(app,'stats_json',return_value={'total':1}) as stats,patch.object(app.time,'monotonic',return_value=100) as clock,patch.dict(app.ORDER_SETTINGS):
+            self.assertEqual(app.dashboard_stats_json(),{'total':1})
+            app.dashboard_stats_json()
+            stats.assert_called_once()
+            clock.return_value=101.1
+            app.dashboard_stats_json()
+            self.assertEqual(stats.call_count,2)
+            app.ORDER_SETTINGS['initial_balance']=12345
+            app.dashboard_stats_json()
+            self.assertEqual(stats.call_count,3)
+
     def test_price_cache_preserves_validation_and_invalidates_after_append(self):
         point={'observed_at':self.start.isoformat(),'price':83000}
         price_history.append('BTC',self.start,point)
@@ -58,6 +89,23 @@ class RuntimePerformanceTests(unittest.TestCase):
             self.assertEqual(price_history.load('BTC',self.start,self.end)[0]['price'],83000)
         price_history.append('BTC',self.start,{'observed_at':(self.start+timedelta(seconds=1)).isoformat(),'price':83001})
         self.assertEqual(len(price_history.load('BTC',self.start,self.end)),2)
+
+    def test_history_page_working_set_does_not_evict_itself(self):
+        rounds=[]
+        for index in range(25):
+            start=self.start-timedelta(minutes=15*index)
+            end=start+timedelta(minutes=15)
+            rounds.append((start,end))
+            price_history.append('BTC',start,{'observed_at':start.isoformat(),'price':83000})
+            price_history.append_live('BTC',start,{'updated_at':start,'recommendation':'UP / ABOVE'})
+        def visit():
+            for start,end in rounds:
+                price_history.load('BTC',start,end)
+                price_history.load('BTC',start,end,include_volatility=False)
+                price_history.live_changes('BTC',start,end)
+        visit()
+        with patch.object(Path,'read_text',side_effect=AssertionError('History page reread cached source files')):
+            visit()
 
     def test_log_archive_retains_all_messages_and_serves_bounded_descending_pages(self):
         ids=[order_logs.append(self.start.isoformat(),f'Update {i}') for i in range(450)]
@@ -125,7 +173,7 @@ class RuntimePerformanceTests(unittest.TestCase):
             page.get_by_role('button',name='Latest',exact=True).click()
             page.wait_for_function("document.querySelector('#orderStatusLogs .order-message').textContent.includes('Waiting 449')")
             page.locator('#orderLogsDialog').evaluate('(e)=>e.close()')
-            poll_source=source[source.index('let statePollBusy=false;'):source.index('setInterval(poll,1000)')]
+            poll_source=source[source.index('let statePollBusy=false;'):source.index('setInterval(poll,500)')]
             page.add_script_tag(content='function render(){window.renderCalls=(window.renderCalls||0)+1;}'+poll_source)
             page.evaluate('()=>{window.fetch=()=>{window.requestCount=(window.requestCount||0)+1;return new Promise(resolve=>window.releaseFetch=resolve);};window.firstPoll=poll();window.secondPoll=poll();}')
             self.assertEqual(page.evaluate('window.requestCount'),1)
