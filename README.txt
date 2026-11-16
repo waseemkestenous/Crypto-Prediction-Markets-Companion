@@ -752,3 +752,12 @@ Elapsed time alone never proves cancellation: uncertain receipts, partial fills,
 GTD orders and virtual orders are not cleared by this rule. Failed refreshes keep
 the purchase blocking retries until the refresh succeeds. Attempt/submission
 identity is rechecked by the backend before either state transition.
+
+CURRENT EVENT MARKET-LIST FALLBACK
+If target validation fails and there is no View current event control, the reader
+checks https://robinhood.com/prediction-markets?category=6e58e4bd-23e4-4616-87a6-14e17f7e29aa
+in a separate tab. It inspects visible event links for the selected asset's
+15-minute market and validates the candidate's heading, round dates and target
+before navigating the main event tab. Expired/future or wrong-asset contracts
+are rejected. Failed/loading listings leave the original event intact and retry.
+The normal expired-event banner remains the preferred navigation path.

@@ -6,6 +6,8 @@ import re
 import shutil
 import subprocess
 import unicodedata
+import json
+from urllib.parse import urlparse
 import order_settings
 import entry_stability
 import round_history
@@ -14,7 +16,24 @@ from datetime import datetime, timedelta, timezone
 
 PROFILE = Path(__file__).resolve().parent / '.robinhood-browser'
 
-EVENT_URL = 'https://robinhood.com/events/5a3f4f9f-82f4-451e-8400-ef2d69c83d37?source=expired_settled_banner'
+EVENT_URL = 'https://robinhood.com/events/9eb401bf-7364-4ef4-a354-87639c2feab0?source=expired_settled_banner'
+CURRENT_MARKETS_URL = 'https://robinhood.com/prediction-markets?category=6e58e4bd-23e4-4616-87a6-14e17f7e29aa'
+
+
+def startup_event_url():
+    """Resume the last verified BTC event instead of an obsolete seed event."""
+    try:
+        saved = json.loads((Path(__file__).resolve().parent / 'current_target.json').read_text())
+        url = saved.get('startup_source_url') or saved.get('source_url', '')
+        parsed = urlparse(url)
+        if (saved.get('asset') == 'BTC' and parsed.scheme == 'https'
+                and parsed.netloc == 'robinhood.com'
+                and parsed.path.startswith('/events/') and parsed.path[len('/events/'):]
+                and not parsed.username and not parsed.password):
+            return url
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return EVENT_URL
 
 
 def target_is_pending(text):
@@ -41,9 +60,61 @@ def open_current_event(page, stop, report):
     return True
 
 
-def refresh_or_open_current(page, stop, report):
-    if not open_current_event(page, stop, report):
-        page.reload(wait_until='domcontentloaded', timeout=60000)
+def open_event_from_market_list(page, stop, report, asset, start, end):
+    """Discover and verify a current event in a separate read-only tab."""
+    report('Checking the Robinhood market list for the current '+asset+' 15-minute event...')
+    probe = page.context.new_page()
+    try:
+        probe.goto(CURRENT_MARKETS_URL, wait_until='domcontentloaded', timeout=45000)
+        links = probe.locator('a[href*="/events/"]')
+        links.first.wait_for(state='attached', timeout=20000)
+        candidates = links.evaluate_all('''elements => elements.filter(e => e.getClientRects().length).map(e => {
+            let node=e, text=e.innerText || '';
+            for(let i=0;i<5 && node;i++,node=node.parentElement){
+                const value=node.innerText || '';
+                if(value.length>1200)break;
+                if(/\\b[A-Z]+\\s+15\\s*min\\b/i.test(value)){text=value;break;}
+            }
+            return {url:e.href,text};
+        })''')
+        seen = set()
+        valid = []
+        for candidate in candidates:
+            url = candidate['url']
+            parsed = urlparse(url)
+            if (url in seen or parsed.scheme != 'https' or parsed.netloc != 'robinhood.com'
+                    or not parsed.path.startswith('/events/') or not parsed.path[len('/events/'):]
+                    or not re.search(rf'\b{re.escape(asset)}\s+15\s*min\b', normalize_event_text(candidate['text']), re.I)):
+                continue
+            seen.add(url)
+            valid.append(url)
+        for url in valid[:3]:
+            if stop.is_set():
+                return False
+            probe.goto(url, wait_until='domcontentloaded', timeout=45000)
+            try:
+                read_event_target(probe, asset, start, end)
+            except ValueError:
+                continue
+            page.goto(probe.url, wait_until='domcontentloaded', timeout=45000)
+            report('Found the current '+asset+' round from the Robinhood market list; verifying its live quotes...')
+            return True
+        report('No verified current '+asset+' round was found on the Robinhood market list; retrying.')
+        return False
+    except Exception as exc:
+        report(f'Robinhood market-list lookup unavailable: {exc}')
+        return False
+    finally:
+        probe.close()
+
+
+def refresh_or_open_current(page, stop, report, *, asset=None, start=None, end=None):
+    if open_current_event(page, stop, report):
+        return
+    if asset and start is not None and end is not None:
+        if open_event_from_market_list(page, stop, report, asset, start, end):
+            return
+    page.reload(wait_until='domcontentloaded', timeout=60000)
 
 
 def refresh_pending_target(page, stop, report):
@@ -1463,7 +1534,7 @@ def browser_loop(stop, snapshot, accept, report, get_prediction, record_purchase
             no_viewport=not headless,
             **({'viewport': {'width': 1920, 'height': 1080}} if headless else {}))
         page = context.pages[0] if context.pages else context.new_page()
-        page.goto(EVENT_URL, wait_until='domcontentloaded', timeout=60000)
+        page.goto(startup_event_url(), wait_until='domcontentloaded', timeout=60000)
         attempted = None
         prepared = None
         refreshed_removal = None
@@ -1550,7 +1621,7 @@ def browser_loop(stop, snapshot, accept, report, get_prediction, record_purchase
                 except ValueError as exc:
                     report(f'Target not recorded: {exc} Refreshing/checking current event in 5 seconds.')
                     if not stop.wait(5):
-                        refresh_or_open_current(page, stop, report)
+                        refresh_or_open_current(page, stop, report, asset=asset, start=start, end=end)
                     continue
                 if not accept(target, asset, start, end, page.url):
                     report(f'Read target {target:,.2f}, but round/asset changed or target was already set; retrying.')
