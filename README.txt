@@ -761,3 +761,14 @@ in a separate tab. It inspects visible event links for the selected asset's
 before navigating the main event tab. Expired/future or wrong-asset contracts
 are rejected. Failed/loading listings leave the original event intact and retry.
 The normal expired-event banner remains the preferred navigation path.
+
+SHARED BUY CONSENSUS CONDITIONS
+Trade Conditions now includes Require Final + fresh Live agreement and Models
+agreeing >= (0/off to 4). They apply to Primary, every fallback and Force Buy.
+When enabled, the purchased side must match both Final and the fresh Live snapshot;
+at least the configured count of Pattern/Recent/Bootstrap/Trend must support it.
+All four model directions must be available when a count is required. Existing
+selected-model filters, prices, time windows and other guards still apply.
+Consensus is checked before preparation, at submission rechecks and by the backend
+when recording a new attempt. Fill and close processing are unaffected. Both
+settings are saved with each purchase; old open pages cannot silently erase them.

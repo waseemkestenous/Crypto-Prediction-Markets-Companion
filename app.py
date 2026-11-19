@@ -545,6 +545,10 @@ def record_robinhood_purchase(asset, start, end, purchase):
 
 def _record_robinhood_purchase(asset, start, end, purchase):
     with LOCK:
+        if purchase.get('status') == 'attempted' and (ORDER_SETTINGS.get('require_final_live_agreement') or ORDER_SETTINGS.get('min_model_agreement')):
+            snapshot = robinhood_form_prediction(asset, start, end)
+            if not robinhood_target.entry_consensus_allows(snapshot, purchase.get('direction')):
+                return False
         if purchase.get('status') == 'attempted':
             guard = current_buy_accuracy_guard()
             virtual_attempt = purchase.get('test_mode') is True and robinhood_target.effective_test_mode(
@@ -1464,6 +1468,9 @@ def api_order_settings():
                              for key in ('current_enabled', 'current_limit', 'block_next_round')
                              if key not in data['choppiness_buy_guard']}
                 data = dict(data, choppiness_buy_guard=dict(data['choppiness_buy_guard'], **additions))
+        if isinstance(data, dict):
+            with LOCK:
+                data = dict(data, **{key: data.get(key, ORDER_SETTINGS.get(key, order_settings.DEFAULTS[key])) for key in ('require_final_live_agreement', 'min_model_agreement')})
         settings = order_settings.validate(data)
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -2081,6 +2088,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 
     <div class="card span12">
       <details class="order-conditions" id="orderSettingsPanel"><summary>Trade Conditions</summary>
+      <div class="purchase-input-row"><label class="contract-field"><input id="requireFinalLiveInput" type="checkbox" onchange="orderSettingsDirty=true"> Require Final + fresh Live agreement</label><label class="contract-field">Models agreeing ≥ <select id="minModelAgreementInput" onchange="orderSettingsDirty=true"><option value="0">Off</option><option value="1">1 of 4</option><option value="2">2 of 4</option><option value="3">3 of 4</option><option value="4">4 of 4</option></select></label><span class="muted">Applies to Primary, all fallbacks and Force Buy.</span></div>
       <label><input id="testModeInput" type="checkbox" onchange="orderSettingsDirty=true"> Test mode — virtual orders only (estimated fills and fees)</label>
       <div class="muted">When the accuracy pause is enabled and accuracy is below its limit, buys automatically become virtual even with Test mode off. Real buys resume when accuracy recovers.</div>
       <div class="contract-settings">
@@ -2402,7 +2410,7 @@ async function saveOrderSettings(){
   const force_close={enabled:document.getElementById('forceCloseEnabled').checked,min_price_cents:Number(document.getElementById('forceCloseMinPriceInput').value),max_brti_delta_dollars:document.getElementById('forceCloseBrtiDeltaInput').value.trim()===''?null:Number(document.getElementById('forceCloseBrtiDeltaInput').value),minute_from:Number(document.getElementById('forceCloseMinuteFromInput').value),minute_to:Number(document.getElementById('forceCloseMinuteToInput').value),time_in_force:document.getElementById('forceCloseTimeInForceInput').value};
   button.disabled=true;
   try{
-    const response=await fetch("/api/order-settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({entry_stability,test_mode,choppiness_buy_guard,accuracy_buy_guard,primary_enabled,min_live_strength,stop_loss,force_close,force_buy,contract_trend_changes,time_in_force,allow_multi_buy,close_conditions,fallbacks,purchase_minute_from,purchase_minute_to,min_price_cents,max_price_cents,contracts,required_models,agreement_basis})});
+    const response=await fetch("/api/order-settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({require_final_live_agreement:document.getElementById('requireFinalLiveInput').checked,min_model_agreement:Number(document.getElementById('minModelAgreementInput').value),entry_stability,test_mode,choppiness_buy_guard,accuracy_buy_guard,primary_enabled,min_live_strength,stop_loss,force_close,force_buy,contract_trend_changes,time_in_force,allow_multi_buy,close_conditions,fallbacks,purchase_minute_from,purchase_minute_to,min_price_cents,max_price_cents,contracts,required_models,agreement_basis})});
     const data=await response.json();
     if(!response.ok||!data.ok) throw new Error(data.error||"Could not save settings");
     orderSettingsDirty=false;
@@ -2568,6 +2576,8 @@ function syncOrderSettings(s){
     document.getElementById("minLiveStrengthInput").value=s.order_settings.min_live_strength||"MODERATE";
     document.getElementById("contractTrendChangesInput").value=s.order_settings.contract_trend_changes??10;
     document.getElementById("agreementBasisInput").value=s.order_settings.agreement_basis||"either";
+    document.getElementById("requireFinalLiveInput").checked=!!s.order_settings.require_final_live_agreement;
+    document.getElementById("minModelAgreementInput").value=String(s.order_settings.min_model_agreement??0);
     const required=s.order_settings.required_models||["Pattern","Recent","Bootstrap","Trend"];
     document.querySelectorAll('input[name="requiredModel"]').forEach(input=>{input.checked=required.includes(input.value);});
     renderFallbackRules((s.order_settings.fallbacks||[s.order_settings.fallback]).filter(Boolean).map(rule=>({...rule,close_conditions:rule.close_conditions||s.order_settings.close_conditions,stop_loss:rule.stop_loss||s.order_settings.stop_loss})));
@@ -3187,7 +3197,7 @@ function purchaseConditionsCell(purchase){
   const stability=c.entry_stability?.enabled?`<div>BTC on buy side of target ≥ ${escapeHistory(c.entry_stability.seconds)} seconds</div>`:'';
   const strength=c.min_live_strength?`<div>Strength ≥ ${escapeHistory(c.min_live_strength)}</div>`:'';
   const trend=c.contract_trend_changes?`<div>Contract price: upward overall trend over ${escapeHistory(c.contract_trend_changes)} changes</div>`:c.contract_upward_changes?`<div>Contract price: ${escapeHistory(c.contract_upward_changes)} consecutive upward changes</div>`:'';
-  return `<details class="order-conditions"><summary>Buy conditions</summary><div class="purchase-detail-fields">${rule}${trend}${strength}${stability}<div>Price &gt; ${escapeHistory(c.min_price_cents)}¢ and &lt; ${escapeHistory(c.max_price_cents)}¢</div><div>Purchase minutes: ${c.purchase_minute_from==null?"Not recorded":`${escapeHistory(c.purchase_minute_from)}–${escapeHistory(c.purchase_minute_to)} after round start`}</div><div>Agree with: ${escapeHistory(sources[c.agreement_basis]||c.agreement_basis)}</div><div>Models: ${escapeHistory(models)}</div><div>CTs: ${escapeHistory(c.contracts)}</div></div></details>`;
+  return `<details class="order-conditions"><summary>Buy conditions</summary><div class="purchase-detail-fields">${rule}${trend}${strength}${stability}<div>Price &gt; ${escapeHistory(c.min_price_cents)}¢ and &lt; ${escapeHistory(c.max_price_cents)}¢</div><div>Purchase minutes: ${c.purchase_minute_from==null?"Not recorded":`${escapeHistory(c.purchase_minute_from)}–${escapeHistory(c.purchase_minute_to)} after round start`}</div><div>Agree with: ${escapeHistory(sources[c.agreement_basis]||c.agreement_basis)}</div><div>Models: ${escapeHistory(models)}</div><div>Final + fresh Live gate: ${c.require_final_live_agreement===true?"On":"Off"} · Minimum model votes: ${escapeHistory(c.min_model_agreement??0)}/4</div><div>CTs: ${escapeHistory(c.contracts)}</div></div></details>`;
 }
 function purchaseMinuteCell(row,plain=false){
   const purchase=row.purchase;

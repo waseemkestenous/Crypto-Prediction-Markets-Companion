@@ -18,6 +18,8 @@ ENTRY_STABILITY_DEFAULTS = {'enabled': False, 'seconds': 60.0}
 DEFAULTS = {'entry_stability': dict(ENTRY_STABILITY_DEFAULTS), 'test_mode': False, 'choppiness_buy_guard': dict(CHOPPINESS_BUY_GUARD_DEFAULTS), 'accuracy_buy_guard': dict(ACCURACY_BUY_GUARD_DEFAULTS), 'primary_enabled':True, 'force_buy':dict(FORCE_BUY_DEFAULTS), 'force_close':dict(FORCE_CLOSE_DEFAULTS), 'min_live_strength': 'MODERATE', 'stop_loss': dict(STOP_LOSS_DEFAULTS), 'contract_trend_changes': 10, 'fallback': dict(FALLBACK_DEFAULTS), 'purchase_minute_from': 0.0, 'purchase_minute_to': 15.0, 'min_price_cents': 0.0, 'max_price_cents': 60.0, 'contracts': 1, 'initial_balance': 0.0, 'required_models': list(MODEL_NAMES), 'agreement_basis': 'either'}
 
 
+DEFAULTS.update(require_final_live_agreement=False, min_model_agreement=0)
+
 def optional_brti_delta(value, label):
     if value is None:
         return None
@@ -109,6 +111,12 @@ def validate(data):
             or any(not isinstance(name, str) or name not in MODEL_NAMES for name in models)
             or len(set(models)) != len(models)):
         raise ValueError('Select valid models without duplicates, or leave all unchecked.')
+    require_final_live_agreement = data.get('require_final_live_agreement', False)
+    min_model_agreement = data.get('min_model_agreement', 0)
+    if not isinstance(require_final_live_agreement, bool):
+        raise ValueError('Final/Live agreement must be true or false.')
+    if isinstance(min_model_agreement, bool) or not isinstance(min_model_agreement, int) or not 0 <= min_model_agreement <= 4:
+        raise ValueError('Minimum model agreement must be a whole number from 0 to 4.')
     basis = data.get('agreement_basis', 'either')
     if basis not in ('final', 'live', 'either', 'both'):
         raise ValueError('Agreement must use Final prediction, Live, either, or both.')
@@ -269,7 +277,8 @@ def validate(data):
     if time_in_force not in ('ioc', 'good_till_date'):
         raise ValueError('Time in force must be IOC or Good till date.')
     return {'entry_stability':stability, 'test_mode':test_mode, 'choppiness_buy_guard':chop, 'accuracy_buy_guard':guard, 'primary_enabled':primary_enabled, 'force_buy':force_buy, 'force_close':manual, 'min_live_strength': min_live_strength, 'stop_loss': stop, 'contract_trend_changes': int(changes), 'time_in_force': time_in_force, 'allow_multi_buy': allow_multi_buy, 'close_conditions': close, 'fallback': fallbacks[0] if fallbacks else dict(FALLBACK_DEFAULTS), 'fallbacks': fallbacks, 'purchase_minute_from': minute_from, 'purchase_minute_to': minute_to, 'min_price_cents': minimum, 'max_price_cents': price, 'contracts': int(numeric_quantity), 'initial_balance': balance,
-            'required_models': [name for name in MODEL_NAMES if name in models], 'agreement_basis': basis}
+            'required_models': [name for name in MODEL_NAMES if name in models], 'agreement_basis': basis,
+            'require_final_live_agreement': require_final_live_agreement, 'min_model_agreement': min_model_agreement}
 
 
 def validate_fallback(fallback):

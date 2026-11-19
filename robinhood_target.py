@@ -308,6 +308,36 @@ def purchase_direction(prediction):
     return None
 
 
+
+def entry_consensus_allows(prediction, direction=None):
+    settings = (prediction or {}).get('order_settings') or {}
+    require = settings.get('require_final_live_agreement', False)
+    minimum = settings.get('min_model_agreement', 0)
+    if not require and not minimum:
+        return True
+    if not prediction:
+        return False
+    valid = ('UP / ABOVE', 'DOWN / BELOW')
+    final, live = prediction.get('direction'), prediction.get('live_direction')
+    direction = direction or live or final
+    if direction not in valid:
+        return False
+    if require and (final != direction or live != direction
+                    or (prediction.get('live_snapshot') or {}).get('direction') != direction):
+        return False
+    models = prediction.get('model_directions') or {}
+    if minimum:
+        if any(models.get(name) not in valid for name in order_settings.MODEL_NAMES):
+            return False
+        if sum(models.get(name) == direction for name in order_settings.MODEL_NAMES) < minimum:
+            return False
+    return True
+
+
+def entry_consensus_reason():
+    return 'Buy waiting: Final and fresh Live must agree, with at least the configured number of models supporting the buy direction.'
+
+
 def in_purchase_window(settings, start, end):
     if start is None or end is None:
         return False
@@ -401,6 +431,11 @@ def buy_choppiness_guard_reason(prediction):
 
 
 def buy_prediction_matches(current, expected, fallback_rule=None, *, force_buy=False):
+    gates = (current or {}).get('order_settings') or {}
+    if gates.get('require_final_live_agreement') or gates.get('min_model_agreement'):
+        direction = current.get('live_direction') if fallback_rule is not None else purchase_direction(current)
+        if not entry_consensus_allows(current, direction):
+            return False
     if effective_test_mode(current) != effective_test_mode(expected):
         return False
     if not effective_test_mode(current) and not buy_accuracy_guard_allows(current):
@@ -434,6 +469,8 @@ def buy_prediction_matches(current, expected, fallback_rule=None, *, force_buy=F
 
 
 def buy_prediction_change_reason(current, expected, *, force_buy=False):
+    if not entry_consensus_allows(current):
+        return entry_consensus_reason()
     if not current:
         return 'Buy waiting: current prediction became unavailable while preparing the form.'
     if not effective_test_mode(current) and not buy_accuracy_guard_allows(current):
@@ -720,6 +757,9 @@ def prepare_contract_form(page, asset, start, end, get_prediction, report, recor
     if direction is None:
         report('Order skipped: selected models must all agree with the selected Final prediction / fresh Live recommendation basis.')
         return False
+    if not entry_consensus_allows(prediction, direction):
+        report(entry_consensus_reason())
+        return False
     if not force_buy and not entry_stability.allows(prediction, direction, datetime.now().astimezone()):
         value = prediction.get('entry_stability') or {}
         report(f"Buy waiting: BTC stability {value.get('seconds', 0):.1f}s; requires {settings['entry_stability']['seconds']:g}s on the {direction} side of the target with fresh quotes.")
@@ -849,7 +889,7 @@ def prepare_contract_form(page, asset, start, end, get_prediction, report, recor
                 "fallback_rule_number": fallback_index + 1 if fallback else None,
                 "fallback_brti_price": prediction.get("brti_price") if fallback else None,
                 "conditions": dict({key: settings[key] for key in
-                               ("min_price_cents", "max_price_cents", "contracts", "required_models", "agreement_basis", "purchase_minute_from", "purchase_minute_to", "time_in_force", "min_live_strength", "entry_stability")}, contract_trend_changes=settings["contract_trend_changes"], contract_trend_method="linear_regression", rule="force_buy" if force_buy else "fallback" if fallback else "primary", fallback=settings["fallback"] if fallback else None, fallback_rule_number=fallback_index + 1 if fallback else None),
+                               ("min_price_cents", "max_price_cents", "contracts", "required_models", "agreement_basis", "purchase_minute_from", "purchase_minute_to", "time_in_force", "min_live_strength", "entry_stability", "require_final_live_agreement", "min_model_agreement")}, contract_trend_changes=settings["contract_trend_changes"], contract_trend_method="linear_regression", rule="force_buy" if force_buy else "fallback" if fallback else "primary", fallback=settings["fallback"] if fallback else None, fallback_rule_number=fallback_index + 1 if fallback else None),
                 "source_url": page.url,
                 "attempted_at": datetime.now().astimezone().isoformat(),
                 "live_recommendation": prediction["live_snapshot"]}

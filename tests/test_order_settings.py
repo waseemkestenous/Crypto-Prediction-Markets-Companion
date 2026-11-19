@@ -177,6 +177,7 @@ class SettingsTests(unittest.TestCase):
             purchase=journal.load('BTC')[0]['purchase']
             self.assertEqual(purchase['status'],'filled')
             self.assertEqual(purchase['conditions'],{
+            'require_final_live_agreement':False,'min_model_agreement':0,
                 'min_price_cents':20,'max_price_cents':60,'contracts':2,
                 'required_models':list(settings.MODEL_NAMES),'agreement_basis':'either',
                 'entry_stability':dict(settings.ENTRY_STABILITY_DEFAULTS),
